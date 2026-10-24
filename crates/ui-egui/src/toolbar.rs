@@ -257,10 +257,10 @@ pub(crate) fn offer_pill(
     crate::scenario::publish_target(handle, rect);
     let hot = response.hovered() || response.has_focus();
     let fill = if hot { t.app_bar_hover_button } else { t.accent };
-    let radius = PILL_HEIGHT / 2.0;
+    let radius = PILL_HEIGHT / 2.0 * f32::from(t.radius_xl) / 10.0;
     ui.painter().rect_filled(rect, radius, fill);
     if response.has_focus() {
-        ui.painter().rect_stroke(rect.expand(2.0), radius + 2.0, Stroke::new(1.0, t.app_bar_text), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(rect.expand(2.0), Tokens::outset_radius(radius, 2.0), Stroke::new(1.0, t.app_bar_text), egui::StrokeKind::Outside);
     }
     let glyph_x = if label.is_some() { rect.left() + icon_x } else { rect.center().x };
     let glyph = Rect::from_center_size(pos2(glyph_x, rect.center().y), vec2(16.0, 16.0));
@@ -600,7 +600,7 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
         .fixed_pos(pos2(ctx.data(|d| d.get_temp::<f32>(egui::Id::new("sc_file_menu_x"))).unwrap_or(100.0), APP_BAR_HEIGHT))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            crate::ui_kit::Menu::frame().show(ui, |ui| {
+            crate::ui_kit::Menu::show_frame(ui, crate::ui_kit::Menu::frame(), |ui| {
                 ui.set_min_width(190.0);
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
                 ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
@@ -915,7 +915,7 @@ fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
     // edges, so their outer corners are concentric with the card's corners.
     let floating = Container::for_layout(app.ui.layout, Surface::Panel).floating();
     let inset = RIBBON_TAB_INSET;
-    let corner = if floating { t.radius_lg.saturating_sub(inset as u8).max(2) } else { 5 };
+    let corner = if floating { t.radius_lg.saturating_sub(inset as u8).max(t.radius_sm / 2) } else { t.control_radius.saturating_sub(1) };
     let search = Rect::from_min_size(pos2(row.right() - search_width - inset, row.top() + inset), vec2(search_width, TAB_ROW_HEIGHT - 2.0 * inset));
     // The single editor is drawn on the foreground layer by shortcut_box::show, so it
     // can grow over the ribbon without being clipped to the tab row.
@@ -1001,9 +1001,10 @@ fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
             Stroke::new(2.0, panel_accent(&t, &app.ui.tab, "")),
         );
     } else {
-        ui.painter().line_segment(
+        t.secondary_line(
+            ui.painter(),
             [row.left_bottom() - vec2(0.0, 0.5), row.right_bottom() - vec2(0.0, 0.5)],
-            Stroke::new(1.0, t.toolbar.lerp_to_gamma(t.border, 0.5)),
+            t.toolbar.lerp_to_gamma(t.border, 0.5),
         );
     }
 }
@@ -1027,7 +1028,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
     let fill = if floating { Color32::TRANSPARENT } else { t.toolbar };
     let ribbon = Container::new(ui.ctx(), Surface::Chrome).edge("sc_toolbar", Edge::Top);
     let frame = Container::new(ui.ctx(), Surface::Chrome).edge_frame(fill);
-    ribbon.exact_size(height).show_separator_line(false).frame(frame).show(ui, |ui| {
+    let chrome = ribbon.exact_size(height).show_separator_line(false).frame(frame).show(ui, |ui| {
         let r = if floating { Rect::from_min_max(cards.workspace.min, cards.ribbon.max) } else { frame.outer_rect(ui.max_rect()) };
         let ws = if floating { cards.workspace } else { Rect::from_min_size(r.left_top(), vec2(WORKSPACE_WIDTH, ribbon_height - 1.0)) };
         let ribbon_left = if floating { cards.ribbon.left() } else { ws.right() };
@@ -1055,11 +1056,11 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         let accent_inset = if floating { f32::from(t.radius_lg) } else { 0.0 };
         painter.rect_filled(
             Rect::from_min_size(ws.left_top() + vec2(accent_inset, 0.0), vec2((ws.width() - 2.0 * accent_inset).max(0.0), t.space_3)),
-            egui::CornerRadius { nw: 0, ne: 0, sw: if floating { 2 } else { 0 }, se: if floating { 2 } else { 0 } },
+            egui::CornerRadius { nw: 0, ne: 0, sw: if floating { t.radius_sm / 2 } else { 0 }, se: if floating { t.radius_sm / 2 } else { 0 } },
             t.accent,
         );
         if !floating {
-            painter.line_segment([ws.right_top(), ws.right_bottom()], Stroke::new(1.0, t.border));
+            t.secondary_line(&painter, [ws.right_top(), ws.right_bottom()], t.border);
         }
         let render = crate::render_workspace::active(app);
         let workspace_icon = if render { "ws_render" } else { "ws_design" };
@@ -1178,7 +1179,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             let width = if finish { finish_width } else { plan.width() };
             if finish && finish_right {
                 px = right - finish_width;
-                painter.line_segment([pos2(px, top), pos2(px, r.bottom() - 1.0)], Stroke::new(1.0, t.border));
+                painter.line_segment([pos2(px, top), pos2(px, r.bottom() - 1.0)], t.tertiary_border(t.border));
             }
             let button_widths = &plan.widths;
             let sketch_create = tab == "SKETCH" && *panel == "CREATE";
@@ -1318,9 +1319,10 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             if !collapsed && drawn > large.len() {
                 if !gallery.is_empty() {
                     // A quiet rule sets the grid apart from the large button before it.
-                    painter.line_segment(
+                    t.secondary_line(
+                        &painter,
                         [pos2(button_x - 1.5, top + 8.0), pos2(button_x - 1.5, top + button_height.min(46.0))],
-                        Stroke::new(1.0, t.toolbar.lerp_to_gamma(t.border, 0.5)),
+                        t.toolbar.lerp_to_gamma(t.border, 0.5),
                     );
                 }
                 for (index, c) in gallery.iter().enumerate() {
@@ -1335,7 +1337,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                     let accent = crate::theme::TabAccent::for_tab(&t, &tab);
                     painter.rect(
                         cell,
-                        4.0,
+                        t.radius_sm,
                         if active {
                             if accent.color == t.accent { t.panel.lerp_to_gamma(command_accent(c.icon), 0.18) } else { accent.soft }
                         } else if resp.hovered() && info.enabled {
@@ -1390,7 +1392,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             let accent = crate::theme::TabAccent::for_tab(&t, &tab);
             let hot = lresp.hovered() && enabled_panel;
             if panel_open || hot {
-                painter.rect_filled(lr, 4.0, if panel_open { accent.soft } else { t.hover });
+                painter.rect_filled(lr, t.radius_sm, if panel_open { accent.soft } else { t.hover });
             }
             let label = if finish { app.tr("ui.ribbon_exit").to_string() } else { ribbon_label(app, panel) };
             let font = if panel_open || hot {
@@ -1440,7 +1442,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 let area = Container::new(ui.ctx(), Surface::Popup).area(popup_id).fixed_pos(lr.left_bottom()).order(egui::Order::Foreground).show(
                     ui.ctx(),
                     |ui| {
-                        section_frame(ui).show(ui, |ui| {
+                        crate::ui_kit::Menu::show_frame(ui, crate::ui_kit::Menu::frame(), |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.set_min_width(200.0);
                             if *panel == "SELECT" {
@@ -1512,7 +1514,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 }
             }
             px += width;
-            painter.line_segment([pos2(px, top + 4.0), pos2(px, top + group_height - 3.0)], Stroke::new(1.0, t.border));
+            painter.line_segment([pos2(px, top + 4.0), pos2(px, top + group_height - 3.0)], t.tertiary_border(t.border));
             px += PANEL_GAP;
         }
         if !overflow.is_empty() {
@@ -1530,7 +1532,14 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                             }
                             for c in cmds {
                                 let info = c.info(&app.session);
-                                let response = crate::ui_kit::command_menu_button(ui, c.id, c.label, c.icon, c.shortcut.unwrap_or(""), info.enabled);
+                                let response = crate::ui_kit::command_menu_button(
+                                    ui,
+                                    c.id,
+                                    c.label,
+                                    c.icon,
+                                    &crate::keymap::display_for(app, c.id).unwrap_or_default(),
+                                    info.enabled,
+                                );
                                 crate::scenario::publish_handle(&format!("toolbar:{}", c.id), response.rect.center());
                                 if response.clicked() {
                                     app.start(c.id);
@@ -1571,6 +1580,14 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             crate::context_menu::open_for(app, at, crate::context_menu::Target::ToolbarCommand { id: id.to_string() });
         }
     });
+    if floating {
+        let frame = Container::new(ui.ctx(), Surface::Chrome).frame(ui.ctx(), t.toolbar, crate::frame::Side::Left);
+        for card in [cards.workspace, cards.ribbon] {
+            Container::paint_inset(ui.painter(), frame.widget_rect(card), frame);
+        }
+    } else {
+        Container::paint_inset(ui.painter(), chrome.response.rect - frame.outer_margin, frame);
+    }
 }
 
 /// A short divider between the brand, file actions and document tabs.
@@ -1625,8 +1642,7 @@ fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft
         let name = app.tr_label(command.label);
         let name_width =
             ui.painter().layout_no_wrap(name.to_string(), crate::fonts::semibold(crate::theme::Tokens::get().font_heading), t.text).size().x;
-        let key_width = command
-            .shortcut
+        let key_width = crate::keymap::display_for(app, command.id)
             .map(|key| {
                 ui.painter().layout_no_wrap(key.to_string(), FontId::monospace(crate::theme::Tokens::get().font_body), t.text_dim).size().x + 24.0
             })
@@ -1635,12 +1651,12 @@ fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(name_width, 20.0), Sense::hover());
             ribbon_text(ui, rect.center(), name, t.font_heading, t.text, true);
-            if let Some(key) = command.shortcut {
+            if let Some(key) = crate::keymap::display_for(app, command.id) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::Frame::NONE
                         .fill(t.panel_header)
-                        .stroke(Stroke::new(1.0, t.border))
-                        .corner_radius(3.0)
+                        .stroke(t.tertiary_border(t.border))
+                        .corner_radius(t.radius_sm.saturating_sub(1))
                         .inner_margin(egui::Margin::symmetric(5, 1))
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new(key).monospace().color(t.text_dim));
@@ -1664,10 +1680,6 @@ fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft
             ui.add(egui::Label::new(egui::RichText::new(reason).color(t.text_dim)).wrap());
         }
     })
-}
-
-fn section_frame(_ui: &egui::Ui) -> egui::Frame {
-    crate::ui_kit::Menu::frame()
 }
 
 fn section_heading(ui: &mut egui::Ui, label: &str, width: f32) {
@@ -1706,8 +1718,7 @@ fn dropdown_width(app: &SolveApp, ui: &egui::Ui, cmds: &[&'static solidcraft_eng
     cmds.iter()
         .map(|c| {
             let label = ui.painter().layout_no_wrap(app.tr_label(c.label).to_string(), font.clone(), t.text).size().x;
-            let key = c
-                .shortcut
+            let key = crate::keymap::display_for(app, c.id)
                 .map(|k| ui.painter().layout_no_wrap(k.to_string(), FontId::monospace(t.font_button), t.text).size().x + 24.0)
                 .unwrap_or(0.0);
             6.0 + 20.0 + 8.0 + label + key + 30.0
@@ -1744,7 +1755,8 @@ fn dropdown_row(app: &SolveApp, ui: &mut egui::Ui, c: &'static solidcraft_engine
     let mut row = crate::ui_kit::MenuItem::new(c.id, &label, c.icon);
     row.enabled = info.enabled;
     row.highlighted = hot;
-    row.shortcut = c.shortcut.unwrap_or("");
+    let shortcut = crate::keymap::display_for(app, c.id).unwrap_or_default();
+    row.shortcut = &shortcut;
     row.paint(ui, rect, &resp, 26.0);
     if hot {
         crate::scenario::publish_handle(&format!("dropdown_hot:{}", c.id), rect.center());
@@ -1752,7 +1764,7 @@ fn dropdown_row(app: &SolveApp, ui: &mut egui::Ui, c: &'static solidcraft_engine
     let p = ui.painter();
     if pointer_on || resp.has_focus() {
         if pin.hovered() {
-            p.rect_filled(pr, 3.0, t.border.gamma_multiply(0.6));
+            p.rect_filled(pr, t.radius_sm.saturating_sub(1), t.border.gamma_multiply(0.6));
         }
         pin_icon(p, pr, pinned, if pinned { t.accent } else { t.text_dim });
         crate::scenario::publish_handle(&format!("dropdown_pin:{}", c.id), pr.center());
@@ -2020,7 +2032,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                     }
                     continue;
                 }
-                if crate::sketch_text_move::cancel_drag(app) {
+                if crate::sketch_text_move::cancel_drag(app) || crate::occurrence_drag::cancel(app) {
                     continue;
                 }
                 if crate::select_other::is_open(app) {
