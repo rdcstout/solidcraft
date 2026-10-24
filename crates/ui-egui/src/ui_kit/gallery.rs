@@ -777,6 +777,16 @@ const ELEMENTS: &[Element] = &[
     element!("expr_row", "dialog:row:Gallery", Some("dialog:Gallery"), |ui, s| {
         expr_row(ui, "Gallery", &mut s.value);
     }),
+    element!("count_row", "dialog:row:Gallery", Some("dialog:Gallery up"), |ui, _| {
+        let mut count = "6".to_owned();
+        count_row(ui, "Gallery", &mut count, &Count { min: 1, max: 10, eval: &|text: &str| text.trim().parse().ok() });
+    }),
+    element!("count_field", "dialog:row:Gallery", Some("dialog:Gallery down"), |ui, _| {
+        row(ui, "Gallery", |ui| {
+            let mut count = "1".to_owned();
+            count_field(ui, &mut count, &Count { min: 1, max: 10, eval: &|text: &str| text.trim().parse().ok() });
+        });
+    }),
     element!("hint_row", "dialog:row:Gallery", Some("dialog:Gallery"), |ui, s| {
         hint_row(ui, "Gallery", &mut s.value, "Value");
     }),
@@ -1027,6 +1037,18 @@ const ELEMENTS: &[Element] = &[
     element!("caption", "dialog:caption:Gallery", None, |ui, _| {
         caption(ui, "Gallery", "Construction");
     }),
+    element!("figure_rows", "dialog:figure:gallery", Some("dialog:Gallery"), |ui, s| {
+        let Sample { value, second, .. } = s;
+        figure_rows(ui, "gallery", &mut [("Gallery", value), ("Second", second)], |painter, rect, slots| {
+            let t = Tokens::get();
+            painter.rect_stroke(rect.shrink(t.space_4), t.control_radius, egui::Stroke::new(1.0, t.form_dim), egui::StrokeKind::Inside);
+            for slot in slots {
+                let ink = if slot.hot { t.form_primary } else { t.form_dim };
+                let y = slot.rect.center().y;
+                painter.line_segment([egui::pos2(rect.center().x, y), egui::pos2(slot.rect.left(), y)], egui::Stroke::new(1.0, ink));
+            }
+        });
+    }),
     element!("section", "dialog:section:Advanced", Some("dialog:section:Advanced"), |ui, _| {
         section(ui, "gallery", "Advanced", false, |_| {});
     }),
@@ -1039,7 +1061,7 @@ const ELEMENTS: &[Element] = &[
             ui.ctx(),
             ui.id().with("popup"),
             anchor,
-            0,
+            Some(0),
             &[PopupOption { kind: "parameter", text: "Width", detail: "10 mm", color: Tokens::get().text }],
             "Choose",
         );
@@ -1321,7 +1343,7 @@ fn popup_suggestions_and_selectable_lists_keep_click_selection() {
                 ui.ctx(),
                 egui::Id::new("suggestions"),
                 egui::Rect::from_min_size(egui::pos2(10.0, 10.0), vec2(220.0, 24.0)),
-                0,
+                Some(0),
                 &[
                     PopupOption { kind: "parameter", text: "width", detail: "Parameter · 10 mm", color: Tokens::get().text },
                     PopupOption { kind: "parameter", text: "height", detail: "Parameter · 20 mm", color: Tokens::get().text },
