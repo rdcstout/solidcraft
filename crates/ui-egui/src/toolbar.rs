@@ -479,13 +479,25 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 crate::prefs::open_at(app, 0);
             }
             if r.width() >= 640.0 {
-                ui.painter().text(
-                    pos2(r.right() - 12.0 - captions, r.center().y),
-                    Align2::RIGHT_CENTER,
-                    format!("v{}", crate::update::current_version()),
-                    FontId::proportional(t.font_small),
-                    t.app_bar_text,
+                // The version links to its release notes.
+                let galley =
+                    ui.painter().layout_no_wrap(format!("v{}", crate::update::current_version()), FontId::proportional(t.font_small), t.app_bar_text);
+                let vrect = Align2::RIGHT_CENTER.anchor_size(pos2(r.right() - 12.0 - captions, r.center().y), galley.size());
+                let vresp = ui.interact(
+                    vrect.expand2(vec2(2.0, 4.0)).intersect(Rect::everything_right_of(report.right())),
+                    ui.id().with("sc_version_link"),
+                    Sense::click(),
                 );
+                let url = crate::update::release_notes_url(crate::update::current_version(), crate::update::release_build());
+                let vresp = vresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&url);
+                if vresp.hovered() || vresp.has_focus() {
+                    ui.painter().hline(vrect.x_range(), vrect.bottom(), Stroke::new(1.0, t.app_bar_text));
+                }
+                ui.painter().galley(vrect.min, galley, t.app_bar_text);
+                crate::scenario::publish_handle("titlebar:version", vrect.center());
+                if vresp.clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
             }
         }
         if app.custom_titlebar {
@@ -1292,7 +1304,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled() && info.enabled, &tr_label));
                 if ribbon_tooltip(app, resp, selected, info.disabled_reason.as_deref()).clicked() && info.enabled {
                     let id = selected.id;
-                    app.start(id);
+                    app.start_pinned(id);
                 }
                 if let Some(f) = family {
                     let ar = if labels {
@@ -1952,6 +1964,22 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
     if app.file_load.busy() {
         return;
     }
+    // File is a custom Area, so it must claim Escape before the underlying editors and
+    // sketch shortcuts. Clear raw events too: egui may replay them on a layout pass.
+    let file_menu_id = egui::Id::new("sc_file_menu");
+    if !app.native_file_menu
+        && ctx.data(|d| d.get_temp::<bool>(file_menu_id).unwrap_or(false))
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        ctx.data_mut(|d| d.insert_temp(file_menu_id, false));
+        egui::Popup::close_all(ctx);
+        ctx.input_mut(|i| {
+            i.raw.events.retain(|event| !matches!(event, egui::Event::Key { key: egui::Key::Escape, modifiers, .. } if modifiers.matches_logically(egui::Modifiers::NONE)));
+        });
+        app.esc_handled = true;
+        app.last_escape = None;
+        return;
+    }
     // The Keyboard Shortcuts window is waiting for a key: it is not a shortcut.
     if crate::keymap::capturing(app) {
         // Parameters is drawn before Preferences; do not let its footer see this Escape.
@@ -2090,6 +2118,50 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod header_report_tests {
     use super::*;
+
+    #[test]
+    fn escape_closes_file_menu_on_home_and_over_a_sketch_without_cancelling_it() {
+        for home in [true, false] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.line", json!({"points":[[0,0],[10,0]]})).unwrap();
+            h.app.start("sketch.line");
+            h.app.home.open = home;
+            h.frames(3);
+            let sketch = h.app.session.active_sketch;
+            let before = h.app.session.doc.to_json();
+            let menu_open = |h: &crate::scenario::Harness| h.ctx.data(|d| d.get_temp::<bool>(egui::Id::new("sc_file_menu")).unwrap_or(false));
+            h.step(&json!({"click":{"handle":"appbar:file"}})).unwrap();
+            assert!(menu_open(&h));
+            h.app.last_escape = Some(h.ctx.input(|i| i.time));
+            h.step(&json!({"key":"Escape"})).unwrap();
+            assert!(!menu_open(&h), "Escape closes File on Home and in the design");
+            assert_eq!(h.app.home.open, home);
+            assert_eq!(h.app.session.active_sketch, sketch);
+            assert!(h.app.tool.is_some(), "closing File must not cancel the sketch tool");
+            assert_eq!(h.app.session.doc.to_json(), before);
+            assert!(h.app.last_escape.is_none(), "closing File must not arm Finish Sketch");
+        }
+    }
+
+    #[test]
+    fn escape_closes_file_menu_before_parameters_and_preserves_selection() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("parameters.change", json!({"name":"width","expression":"10 mm"})).unwrap();
+        h.app.session.selection = vec![solidcraft_engine::Sel::Plane { name: "XY".into() }];
+        h.step(&json!({"start":"parameters.change"})).unwrap();
+        let before = (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.selection.clone());
+        h.step(&json!({"click":{"handle":"appbar:file"}})).unwrap();
+        assert!(h.ctx.data(|d| d.get_temp::<bool>(egui::Id::new("sc_file_menu")).unwrap_or(false)));
+        h.step(&json!({"key":"Escape"})).unwrap();
+        assert!(!h.ctx.data(|d| d.get_temp::<bool>(egui::Id::new("sc_file_menu")).unwrap_or(false)));
+        assert!(h.app.params.is_some(), "the first Escape belongs to File");
+        assert_eq!(before, (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.selection.clone()));
+        h.step(&json!({"key":"Escape"})).unwrap();
+        assert!(h.app.params.is_none(), "the next Escape still closes Parameters");
+        assert_eq!(before, (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.selection.clone()));
+    }
 
     #[test]
     fn native_file_menu_replaces_window_button_and_preserves_fallback() {
@@ -2490,6 +2562,21 @@ mod header_report_tests {
         assert!((en - 114.34375).abs() < 0.05, "Plex Sans report button width: {en}");
         // "Сообщить об ошибке" needs more than the English button's 114 px.
         assert!(ru > en + 10.0, "{ru}");
+    }
+
+    #[test]
+    fn the_version_link_never_covers_the_report_button() {
+        for width in [700.0, 900.0, 1400.0] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.home.open = false;
+            h.app.custom_titlebar = true;
+            h.call("ui.resize", json!({"width":width,"height":720}));
+            h.frames(3);
+            let version = crate::scenario::handle_at("titlebar:version").expect("the version is drawn as a link");
+            let report = crate::scenario::handle_at("titlebar:report").expect("the report button is drawn");
+            // Its click area starts where the report button ends, so a click on that button reaches the report.
+            assert!(version.x > report.x, "width {width}");
+        }
     }
 
     #[test]

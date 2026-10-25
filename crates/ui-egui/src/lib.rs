@@ -259,6 +259,7 @@ pub mod ui_kit;
 #[cfg(test)]
 mod ui_kit_guard_tests;
 pub mod update;
+pub mod view_pick;
 pub mod viewport;
 mod viewport_layout;
 pub mod workspace;
@@ -962,6 +963,16 @@ impl SolveApp {
     /// Start a command the way a toolbar click does: interactive tools and dialogs for commands
     /// that have them, otherwise run it with defaults.
     pub fn start(&mut self, id: &str) {
+        self.start_with_variant_memory(id, true);
+    }
+
+    /// A dedicated toolbar button starts its exact tool without replacing the sketch family's
+    /// main button. Choosing a variant from a menu still uses `start` and remembers that choice.
+    pub(crate) fn start_pinned(&mut self, id: &str) {
+        self.start_with_variant_memory(id, false);
+    }
+
+    fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool) {
         if id == "ui.palette" {
             shortcut_box::open(self, None);
             return;
@@ -1084,7 +1095,7 @@ impl SolveApp {
         if !sketch_tools::start_hook(self, id) {
             return;
         }
-        if solidcraft_engine::find_command(id).is_some_and(|c| c.info(&self.session).enabled) {
+        if remember_variant && solidcraft_engine::find_command(id).is_some_and(|c| c.info(&self.session).enabled) {
             self.preferences.sketch_variants.remember(id);
         }
         if id == "parameters.change" {
@@ -1217,11 +1228,8 @@ impl SolveApp {
             self.edit_sketch(id);
             return;
         }
-        if self.session.active_sketch.is_some() {
-            self.finish_sketch();
-        }
         let Some(idx) = self.session.doc.feature_index(id) else { return };
-        let marker = self.session.doc.marker;
+        let marker = self.finish_sketch_for_edit();
         self.tool = None;
         if dialogs::roll_marker(self, Some(idx)).is_err() {
             return;
@@ -1252,22 +1260,29 @@ impl SolveApp {
         if self.session.active_sketch == Some(id) {
             return;
         }
-        if self.session.active_sketch.is_some() {
-            self.finish_sketch();
-        }
+        let Some(idx) = self.session.doc.feature_index(id) else { return };
+        let marker = self.finish_sketch_for_edit();
         self.tool = None;
         self.dialog = None;
-        let Some(idx) = self.session.doc.feature_index(id) else { return };
-        let marker = self.session.doc.marker;
-        let rolled = marker != Some(idx + 1) && self.run("timeline.roll_to", json!({ "position": idx + 1 })).is_ok();
+        let rolled = self.session.doc.marker != Some(idx + 1) && self.run("timeline.roll_to", json!({ "position": idx + 1 })).is_ok();
         if self.run("sketch.edit", json!({ "sketch": id })).is_err() {
-            if rolled {
+            if rolled || marker != self.session.doc.marker {
                 self.restore_marker(marker);
             }
             return;
         }
-        self.pre_sketch_marker = rolled.then_some(marker);
+        self.pre_sketch_marker = (rolled || marker != self.session.doc.marker).then_some(marker);
         dialogs::look_at_sketch(self);
+    }
+
+    /// Pass the original marker to the next editor. Restoring it between editors could finish
+    /// in the background after the next rollback, moving the marker out from under that edit.
+    fn finish_sketch_for_edit(&mut self) -> Option<usize> {
+        let marker = self.pre_sketch_marker.take().unwrap_or(self.session.doc.marker);
+        if self.session.active_sketch.is_some() {
+            self.finish_sketch();
+        }
+        marker
     }
 
     /// Finish the active sketch: stop editing and restore the history marker Edit Sketch moved.

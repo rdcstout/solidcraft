@@ -668,6 +668,8 @@ preference_settings! {
     /// When true: Shift+click adds without removing; Primary toggles.
     /// When false (default): Shift and Primary both toggle.
     selection_shift_add_only: bool = false, PAGE_SKETCH;
+    /// Drive Joints shows the moved parts' old place as a ghost (its Show ghost box, #5905).
+    drive_joints_ghost: bool = true, PAGE_DESIGN;
     /// Plugin ids turned off (Preferences › Plugins). An installed plugin whose id is absent is on.
     disabled_plugins: std::collections::BTreeSet<String> = std::collections::BTreeSet::new(), PAGE_PLUGINS;
 }
@@ -1454,7 +1456,7 @@ fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
                 ui_kit::slider(
                     ui,
                     &mut app.preferences.space_mouse_speed,
-                    0.25..=3.0,
+                    0.25..=5.0,
                     ui_kit::Slider { step: Some(0.05), format: |value| format!("{value:.2}×"), ..Default::default() },
                 );
             });
@@ -3369,6 +3371,24 @@ mod tests {
     /// next frame draws with their colours (dark following the base), an export gives the theme
     /// back complete, imported themes are saved with the preferences, Remove falls back to the
     /// base and Cancel takes an import back.
+    /// #6161: the theme strip shows a chevron at each end with more themes past it; a click
+    /// scrolls that way.
+    #[test]
+    fn the_theme_strip_shows_where_more_themes_are() {
+        use serde_json::json;
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.prefs", json!({"open": "Interface"}));
+        h.frames(4);
+        let shown = |name: &str| crate::scenario::handle_at(name).is_some();
+        assert!(shown("theme_rail:next"), "more themes than fit: a chevron on the right");
+        assert!(!shown("theme_rail:previous"), "nothing before the first");
+        let first = crate::scenario::handle_at("prefs:theme:light").unwrap();
+        h.step(&json!({"click": {"handle": "theme_rail:next"}})).unwrap();
+        h.frames(4);
+        assert!(shown("theme_rail:previous"), "scrolled: a chevron on the left too");
+        assert!(crate::scenario::handle_at("prefs:theme:light").is_none_or(|p| p.x < first.x), "the strip moved");
+    }
+
     #[test]
     fn system_theme_tile_export_uses_os_brightness_without_selecting_it() {
         let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());

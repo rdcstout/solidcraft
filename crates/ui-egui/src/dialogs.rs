@@ -1209,15 +1209,13 @@ impl Dialog {
         inp.accepts(h, |body, face| snap.and_then(|f| f.planar(body, face)).unwrap_or_else(|| planar_face(s, body, face).is_some()))
     }
 
-    /// Extrude's automatic To Object: with profiles picked, a face or vertex off their plane, or
-    /// a plane parallel to it, is the object to extrude to rather than another profile. While the
-    /// To Object input is active, a parallel plane is taken too (as a place on it).
+    /// With automatic To Object enabled and profiles picked, a face or vertex off their plane,
+    /// or a parallel plane, is the target rather than another profile. An explicitly active
+    /// To Object input accepts parallel planes regardless of the automatic switching preference.
     fn extrude_target(&self, s: &Session, h: &Hit) -> Option<Sel> {
-        if !matches!(self.kind, Kind::Extrude { thin: false, smart: crate::smart_extrude::Smart { auto_to_object: true, .. }, .. }) {
-            return None;
-        }
+        let Kind::Extrude { thin: false, smart, .. } = &self.kind else { return None };
         let to_active = self.active_input().is_some_and(|i| i.label == TO_OBJECT);
-        if self.active != 0 && !to_active {
+        if !to_active && (self.active != 0 || !smart.auto_to_object) {
             return None;
         }
         let reference = profile_plane(s, self.inputs.first()?.items.first()?)?;
@@ -2197,6 +2195,11 @@ fn awaiting_selection(error: &str) -> bool {
     error.get(..7).is_some_and(|start| start.eq_ignore_ascii_case("select "))
 }
 
+/// A dialog's refusal that names what to pick ("select the plane first", "pick an axis").
+fn missing_pick(error: &str) -> bool {
+    awaiting_selection(error) || error.get(..5).is_some_and(|start| start.eq_ignore_ascii_case("pick "))
+}
+
 fn error_rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: &mut egui::Ui) {
     if matches!(d.kind, Kind::SketchModify(_))
         && d.previews()
@@ -2213,6 +2216,12 @@ fn error_rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: &mut 
         // "Select the curves to offset first" is not a failure: nothing is picked yet. The header hint
         // and the disabled OK already say so, so it is not drawn as a red error with an issue button.
         if matches!(d.kind, Kind::SketchModify(_)) && awaiting_selection(&error) {
+            return;
+        }
+        // Other dialogs say so on OK ("select a plane first", "pick an axis"): that is what is
+        // left to pick, not a failure, so it is shown plainly, with no Create Issue (#3292, #3773).
+        if missing_pick(&error) {
+            crate::ui_kit::text(ui, &shown_error(&error), crate::ui_kit::Text::Hint("missing_pick"));
             return;
         }
         ui.vertical(|ui| {
@@ -3305,6 +3314,13 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         (ps.first().map(|x| json!(x.0)).unwrap_or(Value::Null), json!(ps.iter().map(|x| x.1).collect::<Vec<_>>()))
     };
     let face_points = |i: usize| -> Vec<Value> { sels(d, i).face_points().into_iter().map(pt).collect() };
+    // An empty Thickness is no value to shell with: OK waits for one instead of the command
+    // refusing it with an error that asks for an issue report (#960).
+    if let Kind::Shell { thickness } = &d.kind
+        && thickness.trim().is_empty()
+    {
+        return Err("enter the thickness".into());
+    }
     let (cmd, params): (&str, Value) = match &d.kind {
         Kind::ChatContext => return Err("the chat takes these picks; nothing runs".into()),
         Kind::Extrude {
@@ -3385,8 +3401,13 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             }
             let mut out = Vec::new();
             let (sketch, idx) = profiles();
-            if !sketch.is_null() {
-                out.push(("solid.extrude".to_string(), with(json!({"sketch": sketch, "profiles": idx}))));
+            let profile = (!sketch.is_null()).then(|| ("solid.extrude".to_string(), with(json!({"sketch": sketch, "profiles": idx}))));
+            // A new extrude runs its picked faces before its profiles: the profiles' extrude can
+            // cover a picked face, which is then gone when its own extrude looks for it (#3926).
+            // An edit rebuilds the profiles' extrude, so that one stays first.
+            let faces_first = d.editing.is_none();
+            if !faces_first {
+                out.extend(profile.clone());
             }
             // Coplanar faces of one body share one sketch and Boolean. Mixed selections
             // retain their original order and explicit face-body scope.
@@ -3416,12 +3437,18 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 && points.len() > 1
             {
                 out.push(("solid.extrude".to_string(), with(json!({"faces": points, "face_body": body}))));
+                if faces_first {
+                    out.extend(profile);
+                }
                 return Ok(out);
             }
             for pick in sels(d, 0) {
                 if let Sel::Face { body, point, .. } = pick {
                     out.push(("solid.extrude".to_string(), with(json!({"face": pt(*point), "face_body": body}))));
                 }
+            }
+            if faces_first {
+                out.extend(profile);
             }
             return Ok(out);
         }
@@ -3509,7 +3536,15 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         }
         Kind::Shell { .. } => {
             need(0, "faces to remove")?;
-            ("solid.shell", json!({"faces": face_points(0)}))
+            let mut p = json!({"faces": face_points(0)});
+            // The picked faces' body: a point alone may name a flush face of another body (#4555).
+            let mut bodies = sels(d, 0).iter().filter_map(|s| if let Sel::Face { body, .. } = s { Some(body) } else { None });
+            if let Some(first) = bodies.next()
+                && bodies.all(|b| b == first)
+            {
+                p["body"] = json!(first);
+            }
+            ("solid.shell", p)
         }
         Kind::Draft { .. } => {
             need(0, "faces")?;
@@ -5433,7 +5468,7 @@ fn face_point(x: &Sel) -> Option<Value> {
 
 #[cfg(test)]
 mod awaiting_selection_tests {
-    use super::awaiting_selection;
+    use super::{awaiting_selection, missing_pick};
 
     #[test]
     fn missing_selection_messages_are_guidance_and_real_failures_are_not() {
@@ -5448,6 +5483,122 @@ mod awaiting_selection_tests {
         }
         for failure in ["Offset distance must be positive", "the sketch has no curves", "Selection is not on this sketch", "", "sel"] {
             assert!(!awaiting_selection(failure), "{failure}");
+            assert!(!missing_pick(failure), "{failure}");
         }
+        assert!(missing_pick("pick an axis") && missing_pick("select a plane first") && !missing_pick("pickle"));
+    }
+
+    /// Plane at Angle's OK with nothing picked says what to pick, without the red error and its
+    /// Create Issue button that made people file it as a bug (#3292, #3773).
+    #[test]
+    fn a_missing_pick_is_guidance_without_an_issue_button() {
+        let mut h = crate::scenario::Harness::new();
+        h.step(&serde_json::json!({"start":"construct.plane.at_angle"})).unwrap();
+        h.frames(2);
+        h.step(&serde_json::json!({"key":"Enter"})).unwrap();
+        h.frames(2);
+        let d = h.app.dialog.as_ref().expect("the dialog stays open");
+        assert_eq!(d.error.as_deref(), Some("select a plane first"));
+        assert!(crate::scenario::handle_at("dialog:create_issue").is_none(), "no Create Issue for a missing pick");
+    }
+}
+
+#[cfg(test)]
+mod extrude_mixed_pick_tests {
+    //! An extrude of a profile and a body face picked together (#3926).
+
+    use super::*;
+    use crate::scenario::Harness;
+
+    /// A 20 x 20 x 10 box and a sketch rectangle at its top covering half of it. With the profile
+    /// and the top face under it picked, OK extrudes the face (the whole top) and the profile.
+    #[test]
+    fn a_face_under_a_picked_profile_is_still_extruded() {
+        let mut h = Harness::new();
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":10,"corner":[0,0,0]})).unwrap();
+        h.app.run("sketch.create", json!({"plane":{"origin":[0,0,10],"x_dir":[1,0,0],"y_dir":[0,1,0]}})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,20]})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        h.app.run("select.clear", json!({})).unwrap();
+        // The new sketch's profile is taken at once.
+        h.step(&json!({"start":"solid.extrude"})).unwrap();
+        h.frames(2);
+        let st = h.app.session.world_state();
+        let box_body = &st.bodies[0];
+        let top = (0..64)
+            .find(|i| box_body.body.planar_face(*i).is_some_and(|p| p.normal().z > 0.99 && (p.origin.z - 10.0).abs() < 1e-9))
+            .expect("the box's top face");
+        let face = Sel::Face { body: box_body.name.clone(), index: top, point: Vec3::new(5.0, 10.0, 10.0) };
+        let Some(d) = h.app.dialog.as_mut() else { panic!("the extrude dialog") };
+        assert_eq!(d.inputs[0].items.len(), 1, "the profile is picked");
+        d.inputs[0].items.push(face);
+        if let Kind::Extrude { distance, operation, auto_op, .. } = &mut d.kind {
+            *distance = "10 mm".into();
+            *operation = 1;
+            *auto_op = false;
+        }
+        h.frames(2);
+        h.step(&json!({"key":"Enter"})).unwrap();
+        assert!(h.app.dialog.is_none(), "OK: {:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+        let st = h.app.session.world_state();
+        let volume: f64 = st.bodies.iter().map(|b| solidcraft_engine::doc::kernel::measure(&b.body).unwrap().volume).sum();
+        assert!((volume - 8000.0).abs() < 1e-6, "the box grown to 20 mm: {volume}");
+    }
+}
+
+#[cfg(test)]
+mod shell_body_tests {
+    //! The Shell dialog says whose face it removes (#4555).
+
+    use super::*;
+    use crate::scenario::Harness;
+
+    /// Two boxes stacked flush: the upper one's bottom face lies in the lower one's top. Picked
+    /// from below with the lower box hidden, the face is the upper box's, and the dialog says so.
+    #[test]
+    fn a_face_flush_with_another_body_is_shelled_on_its_own_body() {
+        let mut h = Harness::new();
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":20,"corner":[0,0,0]})).unwrap();
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":10,"corner":[0,0,20],"operation":"new"})).unwrap();
+        let st = h.app.session.world_state();
+        let (lower, upper) = (st.bodies[0].name.to_string(), st.bodies[1].name.to_string());
+        h.app.run("browser.visibility", json!({"visible":false,"items":[lower]})).unwrap();
+        h.step(&json!({"call":"ui.view","params":{"view":"bottom"}})).unwrap();
+        h.settle();
+        h.step(&json!({"start":"solid.shell"})).unwrap();
+        h.step(&json!({"click":{"world":[10,10,20]}})).unwrap();
+        h.frames(2);
+        let d = h.app.dialog.as_ref().expect("the shell dialog");
+        let commands = dialog_commands(&h.app, d).unwrap();
+        let (cmd, p) = commands.first().unwrap();
+        assert_eq!(cmd, "solid.shell");
+        assert_eq!(p["body"], json!(upper), "{p}");
+    }
+}
+
+#[cfg(test)]
+mod shell_thickness_tests {
+    //! Shell with its Thickness box emptied (#960).
+
+    use super::*;
+    use crate::scenario::Harness;
+
+    #[test]
+    fn an_empty_thickness_makes_no_command() {
+        let mut h = Harness::new();
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":10,"corner":[0,0,0]})).unwrap();
+        h.step(&json!({"call":"ui.view","params":{"view":"top"}})).unwrap();
+        h.settle();
+        h.step(&json!({"start":"solid.shell"})).unwrap();
+        h.step(&json!({"click":{"world":[10,10,10]}})).unwrap();
+        h.frames(2);
+        let d = h.app.dialog.as_ref().expect("the shell dialog");
+        assert_eq!(d.inputs[0].items.len(), 1, "the top face is picked");
+        assert!(dialog_commands(&h.app, d).is_ok(), "2 mm by default");
+        if let Some(Dialog { kind: Kind::Shell { thickness }, .. }) = h.app.dialog.as_mut() {
+            thickness.clear();
+        }
+        let d = h.app.dialog.as_ref().unwrap();
+        assert_eq!(dialog_commands(&h.app, d).err().as_deref(), Some("enter the thickness"));
     }
 }
