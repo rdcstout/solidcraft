@@ -117,7 +117,7 @@ crate::dialog_descriptor::dialog_descriptors! {
             FeatureKind::Scale { factor, .. }) {
             factor: String = "2".into() => factor.to_string(),
         } => json!({"factor": factor});
-        OffsetFaces("solid.offset_face", "OFFSET FACE", [("Faces", PLANAR_FACES, true)],
+        OffsetFaces("solid.offset_face", "OFFSET FACE", [("Faces", FACES, true)],
             FeatureKind::OffsetFace { distance, .. }) {
             distance: String = "2 mm".into() => distance.to_string(),
         } => json!({"distance": distance});
@@ -341,6 +341,9 @@ crate::dialog_descriptor::dialog_descriptors! {
                 with: Vec<String>,
                 fail: Vec<String>,
             },
+            /// Pick what the agent chat's next message is about (#2286): elements, features and bodies.
+            /// OK hands the picks to the chat (`agent_chat::pick_done`); nothing is run.
+            ChatContext,
             /// Joints and components (`dialogs_assembly`).
             Assembly(crate::dialogs_assembly::Asm),
             /// Sheet metal (`dialogs_sheet`).
@@ -451,6 +454,9 @@ pub struct Dialog {
     pub(crate) chain_applied: bool,
     /// Shell feedback is derived from the picks, never saved as additional face references.
     shell_chain: std::cell::RefCell<Option<ShellChain>>,
+    /// An extrude Press Pull opened with nothing selected: its first pick may be a curved face or
+    /// an edge, which reopens Press Pull on it (an offset or a fillet).
+    pub press_pull: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -598,7 +604,8 @@ fn fits(a: Accept, s: &Sel) -> bool {
         // Sketch points go into a sketch command's own inputs (Entities, a base point), so a
         // box selection and a pre-selection reach them the way a click already does.
         Sel::SketchPoint { .. } => a & (selection::POINTS | selection::SKETCH_POINTS) != 0,
-        Sel::SketchConstraint { .. } | Sel::Occurrence { .. } | Sel::ExternalSketchPoint { .. } => false,
+        Sel::ExternalSketchPoint { .. } => a & selection::EXTERNAL_POINTS != 0,
+        Sel::SketchMidpoint { .. } | Sel::SketchConstraint { .. } | Sel::Occurrence { .. } => false,
     }
 }
 
@@ -629,7 +636,23 @@ impl Dialog {
             picked_edges: Vec::new(),
             chain_applied,
             shell_chain: Default::default(),
+            press_pull: false,
         }
+    }
+
+    /// The picker for the agent chat's context, holding what is already picked.
+    pub fn chat_context(picked: &[Sel]) -> Dialog {
+        let mut inputs = vec![
+            SelInput::new("Elements", FACES | EDGES | selection::VERTICES, true),
+            SelInput::new("Features", selection::FEATURES, true),
+            SelInput::new("Bodies", BODIES, true),
+        ];
+        for sel in picked {
+            if let Some(input) = inputs.iter_mut().find(|i| fits(i.accept, sel)) {
+                input.items.push(sel.clone());
+            }
+        }
+        Dialog::new(Kind::ChatContext, inputs)
     }
 
     pub fn for_command(app: &SolveApp, id: &str) -> Option<Dialog> {
@@ -728,7 +751,18 @@ impl Dialog {
             ),
             "inspect.measure" => Dialog::new(
                 Kind::Measure { result: None, of: Vec::new(), show: None },
-                vec![SelInput::new("Items", FACES | EDGES | selection::VERTICES | selection::CURVES | PROFILES, true)],
+                vec![SelInput::new(
+                    "Items",
+                    FACES
+                        | EDGES
+                        | selection::VERTICES
+                        | CURVES
+                        | selection::POINTS
+                        | PROFILES
+                        | selection::SKETCH_LINES
+                        | selection::EXTERNAL_POINTS,
+                    true,
+                )],
             ),
             "solid.pattern.rectangular" => Dialog::new(
                 Kind::PatternRect { count: "3".into(), spacing: "20 mm".into(), count2: "1".into(), spacing2: "20 mm".into() },
@@ -801,7 +835,7 @@ impl Dialog {
                     operation: 0,
                     at: None,
                 },
-                vec![],
+                vec![SelInput::new("Profile", PROFILES, false)],
             ),
             "solid.combine" => Dialog::new(
                 Kind::Combine { operation: 1, keep_tools: false },
@@ -1247,10 +1281,12 @@ impl Dialog {
             self.profile_selection_changed = true;
         }
         let measure = matches!(self.kind, Kind::Measure { .. });
+        // The chat's picks stay what was clicked: a rim is one edge there, not its pieces.
+        let one = measure || matches!(self.kind, Kind::ChatContext);
         let sel = if measure { crate::viewport::measurement_selection(s, &sel) } else { sel };
         let chain = matches!(self.kind, Kind::Fillet { chain: true, .. });
         let single =
-            if !measure && self.active_input().is_some_and(|i| i.multi) { crate::viewport::picked_selection(s, &sel) } else { vec![sel.clone()] };
+            if !one && self.active_input().is_some_and(|i| i.multi) { crate::viewport::picked_selection(s, &sel) } else { vec![sel.clone()] };
         // Tangent chain: an edge brings the edges that continue it smoothly.
         let picked = if chain { fillet_edges(s, &sel, true) } else { single.clone() };
         // Extrude and revolve take profiles of one sketch.
@@ -1767,6 +1803,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Align { .. } => "ALIGN",
         Kind::BoundaryFill { .. } => "BOUNDARY FILL",
         Kind::Remove => "REMOVE",
+        Kind::ChatContext => "PICK CONTEXT",
         Kind::PathPattern { .. } => "PATTERN ON PATH",
         Kind::Split => "SPLIT BODY",
         Kind::Thread { .. } => "THREAD",
@@ -2467,6 +2504,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let has_ok = !matches!(d.kind, Kind::Sketch | Kind::Measure { .. });
     let valid = match &d.kind {
         Kind::Sketch => false,
+        // Nothing picked is an answer too: OK empties the chat's tray.
+        Kind::ChatContext => true,
         Kind::Material { editor, .. } if editor.editing() => false,
         Kind::SaveMesh(_) => crate::dialogs_save_mesh::ready(&d.inputs),
         Kind::SketchModify(crate::sketch_modify_ui::Mod::Corner { .. }) => {
@@ -2648,6 +2687,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         // Edit Text applies its own way: its live changes and OK are one undo step.
         let run = match &mut d.kind {
             Kind::Text(k) => Some(crate::sketch_text::apply(app, k)),
+            Kind::ChatContext => Some(crate::agent_chat::pick_done(app, &d)),
             _ => match begin_applying(app, &d) {
                 // Computing: the dialog stays, saying so, until it is in.
                 Begun::Later(job) => {
@@ -3027,7 +3067,7 @@ fn shown_origin_plane(app: &SolveApp, name: &str) -> Option<Value> {
 }
 
 /// The world plane of an origin plane or a construction plane by name, where it is shown.
-fn plane_by_name(s: &Session, name: &str) -> Option<solidcraft_engine::geom::Plane> {
+pub(crate) fn plane_by_name(s: &Session, name: &str) -> Option<solidcraft_engine::geom::Plane> {
     if let Some(p) = solidcraft_engine::geom::Plane::named(name) {
         return Some(p);
     }
@@ -3266,6 +3306,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
     };
     let face_points = |i: usize| -> Vec<Value> { sels(d, i).face_points().into_iter().map(pt).collect() };
     let (cmd, params): (&str, Value) = match &d.kind {
+        Kind::ChatContext => return Err("the chat takes these picks; nothing runs".into()),
         Kind::Extrude {
             distance,
             direction,
@@ -3739,7 +3780,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             ("solid.scale", json!({"bodies": sels(d, 0).body_names()}))
         }
         Kind::OffsetFaces { .. } => {
-            need(0, "planar faces")?;
+            need(0, "faces")?;
             ("solid.offset_face", json!({"faces": face_points(0)}))
         }
         Kind::Thread { designation, length, suggested, .. } => {
@@ -3887,6 +3928,14 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let mut p = serde_json::Map::new();
             for (k, v) in fields {
                 p.insert((*k).into(), json!(v));
+            }
+            if *cmd == "solid.coil"
+                && let Some((sketch, index)) = sels(d, 0).profiles().first().copied()
+            {
+                p.insert("sketch".into(), json!(sketch));
+                p.insert("profiles".into(), json!([index]));
+                p.remove("diameter");
+                p.remove("section_size");
             }
             if let Some((point, normal)) = *at {
                 match *cmd {
@@ -4732,6 +4781,61 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                 at: None,
             };
             d.extra.insert("center".into(), pt_expr(center));
+            d
+        }
+        FeatureKind::Coil {
+            base,
+            axis,
+            sketch,
+            profiles,
+            diameter,
+            pitch,
+            turns,
+            section_size,
+            section,
+            position,
+            start_angle,
+            clockwise,
+            operation,
+            targets,
+        } => {
+            let mut d = start("solid.coil")?;
+            d.kind = Kind::Primitive {
+                cmd: "solid.coil",
+                fields: vec![
+                    ("diameter", diameter.as_ref().map(|e| stored_length(s, e)).unwrap_or_default()),
+                    ("revolutions", turns.to_string()),
+                    ("pitch", stored_length(s, pitch)),
+                    ("section_size", section_size.as_ref().map(|e| stored_length(s, e)).unwrap_or_default()),
+                ],
+                operation: op_index(operation),
+                at: None,
+            };
+            if let Some(sketch) = sketch {
+                let items = st.sketch(sketch.0).map(|ss| profile_indices(ss, profiles)).unwrap_or_default();
+                if let Some(inp) = d.inputs.get_mut(0) {
+                    inp.items = items.into_iter().map(|index| Sel::Profile { sketch: sketch.0, index }).collect();
+                }
+            }
+            d.extra.insert("base".into(), pt_expr(base));
+            d.extra.insert("axis".into(), pt3(axis.0));
+            if *section == solidcraft_engine::doc::CoilSection::Square {
+                d.extra.insert("section".into(), json!("square"));
+            }
+            match position {
+                ..0 => d.extra.insert("section_position".into(), json!("inside")),
+                1.. => d.extra.insert("section_position".into(), json!("outside")),
+                0 => None,
+            };
+            if let Some(a) = start_angle {
+                d.extra.insert("start_angle".into(), json!(a.to_string()));
+            }
+            if *clockwise {
+                d.extra.insert("clockwise".into(), json!(true));
+            }
+            if !targets.is_empty() {
+                d.extra.insert("targets".into(), json!(targets));
+            }
             d
         }
         FeatureKind::BoundaryFill { tools, cells, operation, remove_tools } => {

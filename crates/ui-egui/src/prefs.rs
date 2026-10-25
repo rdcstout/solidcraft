@@ -459,6 +459,8 @@ preference_settings! {
     navigator_style: NavigatorStyle = NavigatorStyle::default(), PAGE_NAVIGATION;
     /// Show the radial ring and enable hold/flick gestures for viewport context menus.
     radial_context_menu: bool = false, PAGE_NAVIGATION => check("Radial context menu");
+    /// Work on the model directly in the viewport (pull a face to extrude or cut); off by default.
+    direct_interaction: bool = false, PAGE_NAVIGATION => check("Direct interaction", "Work on the model directly in the viewport. Press a flat face or a profile and pull: up extrudes, down into a body cuts, and sideways movement sets the step size");
     /// Mouse gestures: a ring of tools on the right button.
     mouse_gestures: crate::mouse_gesture::Config = Default::default(), PAGE_NAVIGATION;
     /// The wheel zooms out when turned forward.
@@ -531,6 +533,8 @@ preference_settings! {
     supersampling_adaptive: bool = true, PAGE_GRAPHICS => check_tr("ui.supersampling_adaptive");
     /// Show the frame rate in the view's corner (the view then redraws every frame).
     show_frame_rate: bool = false, PAGE_GRAPHICS => check_id("ui.frame_rate");
+    /// With the frame rate: a frame-time graph, a histogram and what the GPU drew (#2548).
+    frame_rate_details: bool = false, PAGE_GRAPHICS;
     /// Show world X/Y/Z component dimensions beside the total distance in Measure.
     measure_axis_distances: bool = true, PAGE_GRAPHICS => check_id("settings.measure_axis_distances");
     /// Decimals shown for lengths and angles.
@@ -593,6 +597,8 @@ preference_settings! {
     /// hole moves the hole there (`hole_place`). Off by default: a second pick on its face takes
     /// the hole out, and a hole is moved by taking it out and picking again.
     hole_moves: bool = false, PAGE_DESIGN => check("Move holes by clicking or dragging");
+    /// The browser's Origin folder starts hidden in designs that don't keep its eye themselves.
+    hide_origin: bool = false, PAGE_DESIGN => check_tr("ui.hide_origin_by_default");
     /// What a middle-button double-click in the view does: `home`, `fit` or `off`.
     middle_double_click: String = "home".into(), PAGE_NAVIGATION;
     /// Colour vision mode (#778): `off`, `protan`, `deutan` or `tritan`.
@@ -1097,6 +1103,10 @@ pub(crate) fn pivot_under(app: &SolveApp, proj: &crate::viewport::Proj, at: Pos2
             Hit::Edge { mid, .. } => return mid,
             _ => {}
         }
+    }
+    // Over empty space: the middle of the bodies in view, not of everything shown (#2616).
+    if let Some(c) = crate::viewport::in_view_centre(app, proj) {
+        return c;
     }
     let b = crate::viewport::view_bounds(app);
     if b.is_empty() { app.cam.target } else { b.center() }

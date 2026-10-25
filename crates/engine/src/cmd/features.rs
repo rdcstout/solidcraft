@@ -25,7 +25,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .key("E")
         .contract(&EXTRUDE_CONTRACT)
         .output(output_schema_for::<FeatureResult>)
-        .params("distance: expr (or through_all: true); taper?: angle expr; sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); default: every drawn profile, except that a loop inside another is its hole and a loop inside that hole is material again; face?: [x,y,z] (extrude a planar body face instead of a sketch profile); faces?: [[x,y,z],…] (coplanar faces of one body); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric (distance is total thickness, split evenly around the start plane); convention?: total_distance|legacy_per_side (default total_distance; legacy preserves older symmetric extents); distance2?: expr (Two Sides: a second distance the other way from the first side, which may be through_all or to; with direction: negative the first side goes against the normal and distance2 along it); start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body] (Join from a face, or from a sketch on a body's face, defaults to that face's body; explicit targets or participants override); name?; body_name?; thin?: true (Thin: a wall along sketch curves instead of the profiles) with curves?: [curve ids] (open chains and closed loops, joined where they meet end to end; default: every drawn curve of the sketch), thickness: expr, side?: center|inside|outside|two_sides (a closed loop's inside is the area it encloses, an open chain's the side it bends toward, a straight line's the left of its first curve as drawn; default center), thickness2?: expr (two_sides: the thickness outside); corners are mitred, crossing walls are one"),
+        .params("distance: expr (or through_all: true); taper?: angle expr (positive: outward, so the far end is larger along the extrusion direction; negative: inward, so the far end is smaller); sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); default: every drawn profile, except that a loop inside another is its hole and a loop inside that hole is material again; face?: [x,y,z] (extrude a planar body face instead of a sketch profile); faces?: [[x,y,z],…] (coplanar faces of one body); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric (distance is total thickness, split evenly around the start plane); convention?: total_distance|legacy_per_side (default total_distance; legacy preserves older symmetric extents); distance2?: expr (Two Sides: a second distance the other way from the first side, which may be through_all or to; with direction: negative the first side goes against the normal and distance2 along it); start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body] (Join from a face, or from a sketch on a body's face, defaults to that face's body; explicit targets or participants override); name?; body_name?; thin?: true (Thin: a wall along sketch curves instead of the profiles) with curves?: [curve ids] (open chains and closed loops, joined where they meet end to end; default: every drawn curve of the sketch), thickness: expr, side?: center|inside|outside|two_sides (a closed loop's inside is the area it encloses, an open chain's the side it bends toward, a straight line's the left of its first curve as drawn; default center), thickness2?: expr (two_sides: the thickness outside); corners are mitred, crossing walls are one"),
     CommandSpec::new("solid.revolve", "Revolve", revolve)
         .at("SOLID", "CREATE")
         .icon("revolve")
@@ -88,7 +88,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("solid.offset_face", "Offset Face", offset_face)
         .at("SOLID", "MODIFY")
         .icon("offset_face")
-        .params("faces: [[x,y,z] points on planar faces, or face names from model.faces]; distance: expr (positive: outward); body?"),
+        .params("faces: [[x,y,z] points on faces (planar or curved), or face names from model.faces]; distance: expr (positive: outward); body?"),
     CommandSpec::new("solid.thread", "Thread", thread)
         .at("SOLID", "CREATE")
         .icon("thread")
@@ -564,11 +564,12 @@ fn add_feature_in(s: &mut Session, p: &Value, kind: FeatureKind, world: bool) ->
     // A cut or intersect made where the active component has no body of its own (a sketch in
     // the assembly's root, cutting through the parts, #1234) would have nothing to work on: it
     // takes part in every body instead, which it changes only where it meets them. An extrude's
-    // own operation counts too: an automatic one that came out as a cut (#3223).
+    // own operation counts too: an automatic one that came out as a cut (#3223); and so does a
+    // hole, which is always a cut (one at the points of a sketch on a nested part's face).
     let participants = if participants.is_empty()
         && !primitive
         && (matches!(str_(p, "operation").and_then(Operation::parse), Some(Operation::Cut | Operation::Intersect))
-            || matches!(&kind, FeatureKind::Extrude { operation: Operation::Cut | Operation::Intersect, .. }))
+            || matches!(&kind, FeatureKind::Extrude { operation: Operation::Cut | Operation::Intersect, .. } | FeatureKind::Hole { .. }))
         && s.cut_takes_every_body(&s.model.state())
     {
         vec!["*".to_string()]
@@ -771,6 +772,16 @@ fn sketch_face_body(s: &Session, sketch: u64) -> Option<String> {
     active_scope(s, &st).into_iter().find(|b| b.name == anchor.target.body).map(|b| b.name.clone())
 }
 
+/// The bodies a Join named none for: the body whose face a profile sketch is on (the first
+/// sketch that is on one), as for an extrude. Explicit `targets` or `participants` keep theirs.
+fn face_join_targets(s: &Session, p: &Value, operation: Operation, sketches: &[u64]) -> Vec<BodyName> {
+    let mut targets = string_list(p, "targets");
+    if operation == Operation::Join && targets.is_empty() && string_list(p, "participants").is_empty() {
+        targets.extend(sketches.iter().find_map(|sk| sketch_face_body(s, *sk)));
+    }
+    targets.into_iter().map(BodyName).collect()
+}
+
 /// The bodies a feature of the active component works on when it names none: the component's
 /// own. A component with no body of its own (the root of an opened STEP assembly, whose parts
 /// are components inside it) works on the bodies of the components inside it whose geometry is
@@ -935,13 +946,14 @@ fn revolve(s: &mut Session, p: &Value) -> Result<Value> {
         None => solidcraft_doc::RevolveConvention::SketchNormal,
         Some(value) => serde_json::from_value(value.clone()).map_err(|_| bad(cmd, "`convention` must be sketch_normal or legacy_axis_start"))?,
     };
+    let operation = operation(p, cmd)?;
     let kind = FeatureKind::Revolve {
         sketch: SketchId(sketch),
         profiles,
         axis,
         angle,
-        operation: operation(p, cmd)?,
-        targets: string_list(p, "targets").into_iter().map(BodyName).collect(),
+        operation,
+        targets: face_join_targets(s, p, operation, &[sketch]),
         angle2,
         symmetric,
         convention,
@@ -1871,6 +1883,59 @@ fn clearance_diameter(size: &str, fit: &str) -> Option<f64> {
     }
 }
 
+/// The refusal for a thread designation `parse_metric_thread` does not know. A plain `M<d>` with
+/// a sane diameter but no ISO coarse pitch (M28, M7) gets two pitches to try: the largest common
+/// pitch up to about an eighth of the diameter, and the next finer one.
+fn unknown_metric_thread(t: &str, examples: &str) -> String {
+    fine_only_hint(t).unwrap_or_else(|| format!("unknown thread `{t}` (ISO metric, like {examples})"))
+}
+
+/// The pitches to try for a plain `M<d>` that has no ISO coarse pitch, `None` for anything else.
+fn fine_only_hint(t: &str) -> Option<String> {
+    const PITCHES: [f64; 9] = [2.0, 1.5, 1.25, 1.0, 0.75, 0.5, 0.35, 0.25, 0.2];
+    let diameter = t.trim().strip_prefix(['M', 'm']).and_then(|d| d.trim().parse::<f64>().ok());
+    if let Some(d) = diameter.filter(|d| d.is_finite() && *d > 0.2 && *d <= 1e4) {
+        let first = PITCHES.iter().position(|p| *p <= 0.12 * d).unwrap_or(PITCHES.len() - 1);
+        let pitches: Vec<String> = PITCHES.iter().skip(first).take(2).filter(|p| **p < d).map(|p| format!("M{d}x{p}")).collect();
+        if !pitches.is_empty() {
+            return Some(format!("M{d} has no coarse ISO pitch: give one, e.g. {}", pitches.join(" or ")));
+        }
+    }
+    None
+}
+
+/// Largest nominal diameter automatic thread sizing knows (the last ISO coarse size).
+const LARGEST_COARSE: f64 = 56.0;
+
+/// The refusal for automatic sizing on a cylinder too big for the coarse table (a Ø75 shaft):
+/// `None` when sizing finds a thread, or the cylinder is not past the table's end (the feature's
+/// own error then explains). It suggests sizes with a pitch to type, scaled to the diameter.
+fn beyond_coarse_range(st: &solidcraft_doc::ModelState, face: Vec3) -> Option<String> {
+    if solidcraft_doc::suggested_thread(st, face).is_ok() {
+        return None;
+    }
+    let cyl = st.bodies.iter().filter_map(|b| solidcraft_doc::kernel::cylinder_face_at(&b.body, face)).min_by(|a, b| {
+        let dist =
+            |c: &solidcraft_doc::kernel::CylinderFace| ((face - c.axis_point - c.axis * (face - c.axis_point).dot(c.axis)).len() - c.radius).abs();
+        dist(a).total_cmp(&dist(b))
+    })?;
+    let dia = cyl.radius * 2.0;
+    if !dia.is_finite() || dia <= LARGEST_COARSE * 0.9 || dia > 1e4 {
+        return None;
+    }
+    // ISO fine pitches for large sizes: the largest up to about a 25th of the diameter, then the
+    // next finer one. A hole's major diameter is about its bore plus one pitch.
+    const PITCHES: [f64; 4] = [4.0, 3.0, 2.0, 1.5];
+    let first = PITCHES.iter().position(|p| *p <= dia / 25.0 + 1e-6).unwrap_or(PITCHES.len() - 1);
+    let sizes: Vec<String> =
+        PITCHES.iter().skip(first).take(2).map(|p| format!("M{}x{p}", if cyl.internal { dia + p } else { dia }.round())).collect();
+    let kind = if cyl.internal { "hole" } else { "cylinder" };
+    Some(format!(
+        "a {dia:.2} mm {kind} is beyond the coarse thread range (up to M{LARGEST_COARSE}): type a size with its pitch, e.g. {}",
+        sizes.join(" or ")
+    ))
+}
+
 fn hole(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "solid.hole";
     // At sketch points: the holes go perpendicular to the sketch and follow its points.
@@ -1908,7 +1973,10 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(t) = &thread
         && solidcraft_doc::parse_tapped_thread(t).is_none()
     {
-        return Err(bad(cmd, format!("unknown tapped thread `{t}` (ISO metric or a catalogued UNC/UNF, G or Rp size)")));
+        return Err(bad(
+            cmd,
+            fine_only_hint(t).unwrap_or_else(|| format!("unknown tapped thread `{t}` (ISO metric or a catalogued UNC/UNF, G or Rp size)")),
+        ));
     }
     // A position given as length expressions (#1678), say `["leg_h*0.4", "width/2", "t"]`: kept,
     // so the hole follows the parameters; drilled where they evaluate now.
@@ -2189,6 +2257,8 @@ fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let (orientation, twist, scale) = sweep_options(s, p, cmd)?;
     let (rails, rail_fit) = sweep_rails(s, p, cmd, path_sketch)?;
+    let operation = operation(p, cmd)?;
+    let targets = face_join_targets(s, p, operation, &[sketch]);
     add_feature(
         s,
         p,
@@ -2202,8 +2272,8 @@ fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
             scale,
             rails,
             rail_fit,
-            operation: operation(p, cmd)?,
-            targets: string_list(p, "targets").into_iter().map(BodyName).collect(),
+            operation,
+            targets,
         },
     )
 }
@@ -2324,17 +2394,10 @@ fn loft(s: &mut Session, p: &Value) -> Result<Value> {
         sections.push(solidcraft_doc::LoftSection { sketch: SketchId(sketch), profiles: profiles(sec, cmd)?, point: None });
     }
     let (rails, rail_fit) = guide_rails(s, p, cmd, "loft", None)?;
-    add_feature(
-        s,
-        p,
-        FeatureKind::Loft {
-            sections,
-            operation: operation(p, cmd)?,
-            targets: string_list(p, "targets").into_iter().map(BodyName).collect(),
-            rails,
-            rail_fit,
-        },
-    )
+    let operation = operation(p, cmd)?;
+    let sketches: Vec<u64> = sections.iter().map(|sec| sec.sketch.0).collect();
+    let targets = face_join_targets(s, p, operation, &sketches);
+    add_feature(s, p, FeatureKind::Loft { sections, operation, targets, rails, rail_fit })
 }
 
 fn thread(s: &mut Session, p: &Value) -> Result<Value> {
@@ -2347,13 +2410,18 @@ fn thread(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(t) = &designation
         && solidcraft_doc::parse_metric_thread(t).is_none()
     {
-        return Err(bad(cmd, format!("unknown thread `{t}` (ISO metric, like M8 or M8x1)")));
+        return Err(bad(cmd, unknown_metric_thread(t, "M8 or M8x1")));
     }
     let length = expr(p, "length");
     if let Some(l) = &length {
         check_expr(s, l, Kind::Length, cmd, "length")?;
     }
     let modeled = p.get("modeled").and_then(Value::as_bool).unwrap_or(false);
+    if designation.is_none()
+        && let Some(msg) = beyond_coarse_range(&s.model.state(), face)
+    {
+        return Err(bad(cmd, msg));
+    }
     let v = add_feature(s, p, FeatureKind::Thread { face: FacePick(face), designation, length, modeled })?;
     let st = s.model.state();
     let t = v.get("feature").and_then(Value::as_u64).and_then(|id| st.threads.iter().find(|t| t.feature == id).cloned());

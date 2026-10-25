@@ -25,6 +25,17 @@ const MAX_ITEMS: usize = 1_000_000;
 /// Bodies and sketches all the states hold together, at most (a state is a list of clones).
 const MAX_HELD: usize = 50_000_000;
 
+/// A feature's boolean retries as saved. The kernel leaves `rejected` out when it is empty, and
+/// the field has no default when read, so a saved model whose booleans retried was refused and
+/// the design evaluated on every open (#5286): an absent list is an empty one.
+fn saved_diagnostics(d: &Json) -> Result<kernel::BooleanDiagnostics> {
+    let mut d = d.clone();
+    if let Some(fields) = d.as_object_mut() {
+        fields.entry("rejected").or_insert_with(|| json!([]));
+    }
+    serde_json::from_value(d).map_err(|_| bad("saved model: diagnostics"))
+}
+
 fn hex(v: u64) -> String {
     format!("{v:016x}")
 }
@@ -319,6 +330,7 @@ impl SavedModel {
                     .insert(k.get(0).and_then(Json::as_u64).ok_or_else(|| bad("saved model: state"))?, unhex(k.get(1).unwrap_or(&Json::Null))?);
             }
             let st = ModelState {
+                frame_bodies: Default::default(),
                 bodies: ids("bodies", model_bodies.len())?.into_iter().filter_map(|i| model_bodies.get(i).cloned()).collect(),
                 sketches: ids("sketches", sketches.len())?.into_iter().filter_map(|i| sketches.get(i).cloned()).collect(),
                 body_counter: index(s.get("body_counter"), usize::MAX)?,
@@ -518,7 +530,11 @@ impl Model {
     /// did not keep ([`SavedModel::thinned`]). Refused (an error) unless every feature's
     /// fingerprint is the one `doc` gives it now, and every record is well formed.
     pub fn adopt(doc: &Document, saved: &SavedModel) -> Result<Model> {
-        let states = saved.states()?;
+        let mut states = saved.states()?;
+        let frame_bodies = Arc::new(std::sync::Mutex::new(FrameBodies::default()));
+        for state in &mut states {
+            Arc::make_mut(state).frame_bodies = Arc::downgrade(&frame_bodies);
+        }
         let records = &saved.records;
         let index = |v: Option<&Json>, len: usize| {
             v.and_then(Json::as_u64).and_then(|i| usize::try_from(i).ok()).filter(|i| *i < len).ok_or_else(|| bad("saved model: index"))
@@ -557,7 +573,7 @@ impl Model {
                 error: None,
                 warning: r.get("warning").map(|w| text(Some(w))).transpose()?,
                 boolean_diagnostics: match r.get("diagnostics") {
-                    Some(d) => serde_json::from_value(d.clone()).map_err(|_| bad("saved model: diagnostics"))?,
+                    Some(d) => saved_diagnostics(d)?,
                     None => Default::default(),
                 },
                 ms,
@@ -573,7 +589,7 @@ impl Model {
             }
             results.push(result);
         }
-        let mut model = Model { results, param_errors, step_digests, ..Model::default() };
+        let mut model = Model { results, param_errors, step_digests, frame_bodies, ..Model::default() };
         let unkept = model.results.iter().filter(|r| r.unkept).count();
         if unkept > 0 {
             // The features whose state the file did not keep, each evaluated again from the state
