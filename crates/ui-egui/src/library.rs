@@ -1,5 +1,6 @@
 //! Folder-backed document navigation. Browsing never rewrites design contents;
 //! selecting a file uses the existing document loader and its unsaved-document handling.
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -12,6 +13,51 @@ mod actions;
 
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_ENTRIES: usize = 10_000;
+
+const MAX_RECENT_FOLDERS: usize = 10;
+
+const MAX_HIGHLIGHTS: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Highlight {
+    Red,
+    Orange,
+    Green,
+    Blue,
+    Purple,
+}
+
+impl Highlight {
+    const ALL: [Self; 5] = [Self::Red, Self::Orange, Self::Green, Self::Blue, Self::Purple];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Red => "library.highlight_red",
+            Self::Orange => "library.highlight_orange",
+            Self::Green => "library.highlight_green",
+            Self::Blue => "library.highlight_blue",
+            Self::Purple => "library.highlight_purple",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        let t = crate::theme::Tokens::get();
+        match self {
+            Self::Red => t.library_highlights[0],
+            Self::Orange => t.library_highlights[1],
+            Self::Green => t.library_highlights[2],
+            Self::Blue => t.library_highlights[3],
+            Self::Purple => t.library_highlights[4],
+        }
+    }
+}
+
+#[derive(Default)]
+struct CardStatus {
+    active: bool,
+    highlight: Option<Highlight>,
+}
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -29,6 +75,9 @@ struct Listing {
 #[derive(Default)]
 pub struct LibraryState {
     root: Option<PathBuf>,
+    recent_roots: Vec<PathBuf>,
+    pinned_roots: Vec<PathBuf>,
+    highlights: BTreeMap<PathBuf, Highlight>,
     current: PathBuf,
     collapsed: bool,
     search: String,
@@ -37,27 +86,114 @@ pub struct LibraryState {
     listing: Listing,
     error: Option<String>,
     action_dialog: Option<actions::Dialog>,
+    folders_expanded: bool,
+    folder_menu: Option<(PathBuf, egui::Response, egui::Pos2)>,
     #[cfg(not(target_arch = "wasm32"))]
     pending: Option<std::sync::mpsc::Receiver<Result<Listing, String>>>,
 }
 
 impl LibraryState {
     pub fn prefs(&self) -> Value {
-        json!({"root": self.root, "collapsed": self.collapsed})
+        json!({"root": self.root, "collapsed": self.collapsed, "recent_roots": self.recent_roots, "pinned_roots": self.pinned_roots, "highlights": self.highlights})
     }
 
     pub fn load(&mut self, value: Option<&Value>) {
         let Some(value) = value else { return };
+        self.highlights.clear();
+        if let Some(highlights) = value.get("highlights").and_then(Value::as_object) {
+            for (path, color) in highlights.iter().take(MAX_HIGHLIGHTS) {
+                if !path.is_empty()
+                    && path.len() <= 32_768
+                    && let Ok(color) = serde_json::from_value::<Highlight>(color.clone())
+                {
+                    self.highlights.insert(PathBuf::from(path), color);
+                }
+            }
+        }
+        self.recent_roots.clear();
+        self.pinned_roots.clear();
+        if let Some(recent) = value.get("recent_roots").and_then(Value::as_array) {
+            for path in recent.iter().take(MAX_RECENT_FOLDERS * 2).rev().filter_map(Value::as_str).filter(|p| !p.is_empty() && p.len() <= 32_768) {
+                let path = PathBuf::from(path);
+                if !self.recent_roots.contains(&path) {
+                    self.recent_roots.insert(0, path);
+                }
+            }
+        }
+        if let Some(pinned) = value.get("pinned_roots").and_then(Value::as_array) {
+            for path in pinned.iter().take(MAX_RECENT_FOLDERS).filter_map(Value::as_str).map(PathBuf::from) {
+                if self.recent_roots.contains(&path) && !self.pinned_roots.contains(&path) {
+                    self.pinned_roots.push(path);
+                }
+            }
+        }
+        self.trim_history();
         let collapsed = value.get("collapsed").and_then(Value::as_bool).unwrap_or(false);
         if let Some(root) = value.get("root").and_then(Value::as_str).filter(|p| !p.is_empty() && p.len() <= 32_768) {
-            self.set_root(PathBuf::from(root));
+            let root = PathBuf::from(root);
+            if !value.get("recent_roots").is_some_and(Value::is_array) {
+                self.remember_root(root.clone());
+            }
+            self.root = Some(root.clone());
+            self.navigate(root);
         }
         self.collapsed = collapsed;
     }
 
+    fn set_highlight(&mut self, path: &Path, color: Option<Highlight>) {
+        if let Some(color) = color {
+            if self.highlights.contains_key(path) || self.highlights.len() < MAX_HIGHLIGHTS {
+                self.highlights.insert(path.to_path_buf(), color);
+            } else {
+                self.error = Some(crate::i18n::tr("library.highlight_limit").to_string());
+            }
+        } else {
+            self.highlights.remove(path);
+        }
+    }
+
+    fn remember_root(&mut self, root: PathBuf) {
+        self.recent_roots.retain(|path| path != &root);
+        self.recent_roots.insert(0, root);
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        let mut unpinned = 0;
+        self.recent_roots.retain(|path| {
+            if self.pinned_roots.contains(path) {
+                true
+            } else {
+                unpinned += 1;
+                unpinned <= MAX_RECENT_FOLDERS
+            }
+        });
+    }
+
+    fn recent_folders(&self) -> Vec<PathBuf> {
+        self.pinned_roots.iter().chain(self.recent_roots.iter().filter(|p| !self.pinned_roots.contains(p))).cloned().collect()
+    }
+
+    fn remove_recent(&mut self, path: &Path) {
+        let position = self.recent_folders().iter().position(|p| p == path).unwrap_or(0);
+        self.recent_roots.retain(|p| p != path);
+        self.pinned_roots.retain(|p| p != path);
+        let remaining = self.recent_folders();
+        if let [only] = remaining.as_slice() {
+            self.set_root(only.clone());
+        } else if self.root.as_deref() == Some(path) {
+            let next = remaining.get(position).or_else(|| remaining.first()).cloned();
+            self.root = next.clone();
+            self.navigate(next.unwrap_or_default());
+        }
+    }
+
     fn set_root(&mut self, root: PathBuf) {
+        self.remember_root(root.clone());
         self.root = Some(root.clone());
         self.collapsed = false;
+        self.folders_expanded = false;
+        self.folder_menu = None;
         self.navigate(root);
     }
 
@@ -253,9 +389,23 @@ fn messages(state: &LibraryState, ui: &mut egui::Ui) {
 }
 
 /// Shared card layout for real documents and the built-in examples.
-fn thumbnail_card(ui: &mut egui::Ui, width: f32, height: f32, name: &str, texture: Option<egui::TextureHandle>, icon: &str) -> egui::Response {
+fn thumbnail_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    name: &str,
+    texture: Option<egui::TextureHandle>,
+    icon: &str,
+    status: CardStatus,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    response.widget_info(|| {
+        if status.active {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, true, true, name)
+        } else {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+        }
+    });
     let t = crate::theme::Tokens::get();
     ui.painter().rect(
         rect,
@@ -270,7 +420,19 @@ fn thumbnail_card(ui: &mut egui::Ui, width: f32, height: f32, name: &str, textur
     } else {
         crate::icons::paint_on(ui.painter(), egui::Rect::from_center_size(image.center(), egui::vec2(36.0, 36.0)), icon, None, 1.0);
     }
-    let label = egui::Rect::from_min_max(egui::pos2(rect.left() + 6.0, rect.bottom() - 25.0), rect.max - egui::vec2(6.0, 3.0));
+    if status.active {
+        let center = egui::pos2(image.left() + 10.0, image.top() + 10.0);
+        ui.painter().circle_filled(center, 5.0, t.field);
+        ui.painter().circle_filled(center, 4.0, t.accent);
+        crate::scenario::publish_rect("library:active_indicator", egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)));
+    }
+    let mut label = egui::Rect::from_min_max(egui::pos2(rect.left() + 6.0, rect.bottom() - 25.0), rect.max - egui::vec2(6.0, 3.0));
+    if let Some(highlight) = status.highlight {
+        let marker = egui::Rect::from_min_size(label.min + egui::vec2(0.0, 1.0), egui::vec2(4.0, 16.0));
+        ui.painter().rect_filled(marker, 1.0, highlight.color());
+        crate::scenario::publish_rect("library:highlight_indicator", marker);
+        label.min.x += 10.0;
+    }
     ui.painter().with_clip_rect(label).text(label.left_top(), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(12.0), t.text);
     response
 }
@@ -288,7 +450,7 @@ fn sample_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
                     let index = row * 2 + column;
                     let Some(sample) = samples.get(index) else { continue };
                     let texture = crate::home::document_thumbnail(app, ui.ctx(), &format!("sample:{index}"));
-                    let response = thumbnail_card(ui, width, height, app.tr_label(sample.name), texture, "box");
+                    let response = thumbnail_card(ui, width, height, app.tr_label(sample.name), texture, "box", CardStatus::default());
                     crate::scenario::publish_handle(&format!("library:sample:{index}"), response.rect.center());
                     if response.on_hover_text(app.tr_label(sample.about)).clicked() {
                         chosen = Some(index);
@@ -325,10 +487,27 @@ fn rows(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
                     let Some(entry) = indices.get(index).and_then(|i| app.library.listing.entries.get(*i)).cloned() else { continue };
                     let texture =
                         if entry.folder { None } else { entry.path.to_str().and_then(|path| crate::home::document_thumbnail(app, ui.ctx(), path)) };
-                    let response = thumbnail_card(ui, width, height, &entry.name, texture, if entry.folder { "folder" } else { "new" });
+                    let active = !entry.folder && app.session.path.as_deref().map(Path::new) == Some(entry.path.as_path());
+                    let highlight = if entry.folder { None } else { app.library.highlights.get(&entry.path).copied() };
+                    let response = thumbnail_card(
+                        ui,
+                        width,
+                        height,
+                        &entry.name,
+                        texture,
+                        if entry.folder { "folder" } else { "new" },
+                        CardStatus { active, highlight },
+                    );
                     crate::scenario::publish_handle(&format!("library:entry:{index}"), response.rect.center());
                     actions::context_menu(app, ui, &response, &entry);
-                    if response.on_hover_text(entry.path.display().to_string()).clicked() {
+                    let tooltip =
+                        if active { format!("{}\n{}", entry.path.display(), app.tr("home.open_now")) } else { entry.path.display().to_string() };
+                    let tooltip = if let Some(highlight) = highlight {
+                        format!("{tooltip}\n{}: {}", app.tr("library.highlight"), app.tr(highlight.label()))
+                    } else {
+                        tooltip
+                    };
+                    if response.on_hover_text(tooltip).clicked() {
                         chosen = Some(entry);
                     }
                 }
@@ -404,7 +583,7 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
             go_home(app);
         }
         let (chevron, _) = ui.allocate_exact_size(egui::vec2(12.0, 24.0), egui::Sense::hover());
-        crate::ui_kit::disclosure(ui.painter(), chevron.center(), false, crate::theme::Tokens::get().text_dim);
+        crate::ui_kit::disclosure(ui.painter(), chevron.center(), app.library.folders_expanded, crate::theme::Tokens::get().text_dim);
         let name = app
             .library
             .root
@@ -414,9 +593,21 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
         let size = egui::vec2((ui.available_width() - 32.0).max(1.0), 24.0);
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let mut label_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        label_ui
-            .add(egui::Label::new(egui::RichText::new(name).color(crate::theme::Tokens::get().text).strong()).truncate())
-            .on_hover_text(app.library.root.as_deref().unwrap_or(Path::new("")).display().to_string());
+        label_ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        let picker = crate::ui_kit::list_picker(&mut label_ui, "library_folder_section", &name, app.library.folders_expanded);
+        picker.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::CollapsingHeader,
+                true,
+                app.library.folders_expanded,
+                crate::i18n::tr("library.recent_folders"),
+            )
+        });
+        crate::scenario::publish_target("library:folders", picker.rect);
+        if picker.on_hover_text(crate::i18n::tr("library.recent_folders")).clicked() {
+            app.library.folders_expanded = !app.library.folders_expanded;
+            app.library.folder_menu = None;
+        }
         let (rect, settings) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
         if settings.hovered() || settings.has_focus() {
             ui.painter().rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
@@ -435,6 +626,65 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
             choose_folder(app);
         }
     });
+    if app.library.folders_expanded {
+        ui.separator();
+        let recent = app.library.recent_folders();
+        let mut selected = None;
+        egui::ScrollArea::vertical().id_salt("library_recent_folders").max_height(180.0).show(ui, |ui| {
+            for (index, path) in recent.iter().enumerate() {
+                if index > 0 && index == app.library.pinned_roots.len() {
+                    ui.separator();
+                }
+                let label = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                let duplicate_name = recent.iter().filter(|other| other.file_name() == path.file_name()).count() > 1;
+                let label = if duplicate_name { path.display().to_string() } else { label.into_owned() };
+                let response = crate::ui_kit::list_picker(ui, &format!("library_folder_{index}"), &label, app.library.root.as_ref() == Some(path));
+                crate::scenario::publish_handle(&format!("library:recent:{index}"), response.rect.center());
+                let response = response.on_hover_text(path.display().to_string());
+                let keyboard = response.has_focus() && ui.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::F10));
+                if response.secondary_clicked() || keyboard {
+                    let at = ui.ctx().pointer_interact_pos().unwrap_or(response.rect.center());
+                    app.library.folder_menu = Some((path.clone(), response.clone(), at));
+                }
+                if response.clicked() {
+                    selected = Some(path.clone());
+                }
+            }
+        });
+        if let Some(path) = selected {
+            app.library.set_root(path);
+        }
+        ui.separator();
+    }
+    if let Some((path, response, at)) = app.library.folder_menu.take() {
+        let mut open = true;
+        Container::new(ui.ctx(), Surface::Popup).context_menu(&response).open_bool(&mut open).at_position(at).show(|ui| {
+            let pinned = app.library.pinned_roots.contains(&path);
+            let pin_key = if pinned { "library.unpin_folder" } else { "library.pin_folder" };
+            if crate::ui_kit::button(
+                ui,
+                crate::i18n::tr(pin_key),
+                crate::ui_kit::Button::Enabled(pinned || app.library.pinned_roots.len() < MAX_RECENT_FOLDERS),
+            )
+            .clicked()
+            {
+                if pinned {
+                    app.library.pinned_roots.retain(|p| p != &path);
+                    app.library.trim_history();
+                } else {
+                    app.library.pinned_roots.push(path.clone());
+                }
+                ui.close();
+            }
+            if crate::ui_kit::button(ui, crate::i18n::tr("library.remove_folder"), crate::ui_kit::Button::Normal).clicked() {
+                app.library.remove_recent(&path);
+                ui.close();
+            }
+        });
+        if open {
+            app.library.folder_menu = Some((path, response, at));
+        }
+    }
     if app.library.root.is_none() {
         egui::Frame::NONE.fill(crate::theme::Tokens::get().field).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
             ui.label("Sample designs only. Use the gear above to choose your CAD folder.");
@@ -587,6 +837,244 @@ mod tests {
     }
 
     #[test]
+    fn recent_folders_are_bounded_deduplicated_and_persist_pins_and_removals() {
+        let mut state = LibraryState::default();
+        state.load(Some(&json!({"root":"/legacy/CAD", "collapsed":true})));
+        assert_eq!(state.recent_folders(), [PathBuf::from("/legacy/CAD")]);
+        state.pinned_roots.push(PathBuf::from("/legacy/CAD"));
+        for index in 0..30 {
+            state.remember_root(PathBuf::from(format!("/project/{index}")));
+        }
+        assert_eq!(state.recent_roots.len(), MAX_RECENT_FOLDERS + 1);
+        assert_eq!(state.recent_folders()[0], PathBuf::from("/legacy/CAD"));
+        state.remember_root(PathBuf::from("/project/29"));
+        assert_eq!(state.recent_roots.len(), MAX_RECENT_FOLDERS + 1);
+        let mut pinned_restore = LibraryState::default();
+        pinned_restore.load(Some(&state.prefs()));
+        assert_eq!(pinned_restore.pinned_roots, state.pinned_roots);
+        assert_eq!(pinned_restore.recent_folders(), state.recent_folders());
+        state.remove_recent(Path::new("/legacy/CAD"));
+        let mut restored = LibraryState::default();
+        restored.load(Some(&state.prefs()));
+        assert_eq!(restored.root, state.root, "replacement folder persists after removal");
+        assert_eq!(restored.recent_folders(), state.recent_folders(), "removed active folder stays removed on restart");
+        assert!(restored.pinned_roots.is_empty());
+        restored.load(Some(&json!({"recent_roots":[null,"","/valid","/valid",42],"pinned_roots":["/missing","/valid","/valid"]})));
+        assert_eq!(restored.recent_folders(), [PathBuf::from("/valid")]);
+        assert_eq!(restored.pinned_roots.len(), 1);
+    }
+
+    #[test]
+    fn recent_folder_dropdown_switches_pins_and_removes_without_touching_files() {
+        let mut h = Harness::new();
+        folder_picker(&mut h, None);
+        h.app.home.open = false;
+        let first = h.dir.join("First");
+        let second = h.dir.join("Second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(first.join("keep.txt"), b"untouched").unwrap();
+        h.app.library.set_root(first.clone());
+        h.app.library.set_root(second.clone());
+        h.frames(3);
+        let search_before = crate::scenario::rect_of("library:search_card").unwrap();
+        h.step(&json!({"click":{"handle":"library:folders"}})).unwrap();
+        assert!(crate::scenario::rect_of("library:search_card").unwrap().top() > search_before.top());
+        h.step(&json!({"click":{"handle":"library:recent:1"},"button":"right"})).unwrap();
+        assert!(h.app.library.folders_expanded);
+        assert!(h.widget("Second").is_some());
+        h.step(&json!({"widget":"Pin to top"})).unwrap();
+        assert_eq!(h.app.library.recent_folders()[0], first);
+        h.frames(2);
+        assert!(h.app.library.folders_expanded);
+        h.step(&json!({"click":{"handle":"library:recent:0"}})).unwrap();
+        wait(&mut h.app);
+        assert_eq!(h.app.library.root.as_ref(), Some(&first));
+        assert!(h.app.library.search.is_empty());
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"library:folders"}})).unwrap();
+        h.step(&json!({"click":{"handle":"library:recent:0"},"button":"right"})).unwrap();
+        h.step(&json!({"widget":"Remove from list"})).unwrap();
+        assert!(!h.app.library.folders_expanded);
+        assert_eq!(h.app.library.root.as_ref(), Some(&second));
+        assert!(!h.app.library.recent_folders().contains(&first));
+        assert_eq!(std::fs::read(first.join("keep.txt")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn removing_three_folders_down_to_one_selects_the_survivor_and_collapses() {
+        for remove_active in [true, false] {
+            for pinned in [true, false] {
+                let mut h = Harness::new();
+                folder_picker(&mut h, None);
+                h.app.home.open = false;
+                let paths = [h.dir.join("First"), h.dir.join("Second"), h.dir.join("Third")];
+                for path in &paths {
+                    std::fs::create_dir(path).unwrap();
+                    std::fs::write(path.join("keep.txt"), b"untouched").unwrap();
+                    h.app.library.set_root(path.clone());
+                }
+                let survivor = &paths[if remove_active { 0 } else { 2 }];
+                if pinned {
+                    h.app.library.pinned_roots.push(survivor.clone());
+                }
+                h.frames(3);
+                h.step(&json!({"click":{"handle":"library:folders"}})).unwrap();
+                for (step, remove) in [if remove_active { &paths[2] } else { &paths[0] }, &paths[1]].iter().enumerate() {
+                    let index = h.app.library.recent_folders().iter().position(|path| path == *remove).unwrap();
+                    h.step(&json!({"click":{"handle":format!("library:recent:{index}")},"button":"right"})).unwrap();
+                    h.step(&json!({"widget":"Remove from list"})).unwrap();
+                    wait(&mut h.app);
+                    h.frames(2);
+                    assert_eq!(h.app.library.recent_folders().len(), 2 - step);
+                    assert_eq!(h.app.library.folders_expanded, step == 0);
+                }
+                assert_eq!(h.app.library.root.as_ref(), Some(survivor));
+                assert_eq!(&h.app.library.current, survivor);
+                assert!(h.app.library.folder_menu.is_none());
+                for path in &paths {
+                    assert_eq!(std::fs::read(path.join("keep.txt")).unwrap(), b"untouched");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removing_folders_switches_only_the_active_view_and_clears_the_last_listing() {
+        let mut h = Harness::new();
+        let first = h.dir.join("First");
+        let second = h.dir.join("Second");
+        let third = h.dir.join("Third");
+        for path in [&first, &second, &third] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::create_dir(path.join("Contents")).unwrap();
+            h.app.library.set_root(path.clone());
+        }
+        h.app.library.pinned_roots.push(first.clone());
+        h.app.library.folders_expanded = true;
+        h.app.library.remove_recent(&third);
+        wait(&mut h.app);
+        assert_eq!(h.app.library.root.as_ref(), Some(&second), "select the row after the removed active row");
+        assert!(h.app.library.folders_expanded);
+        assert_eq!(h.app.library.current, second);
+        assert_eq!(h.app.library.listing.entries.len(), 1);
+        h.app.library.remove_recent(&first);
+        assert_eq!(h.app.library.root.as_ref(), Some(&second), "removing an inactive row preserves the view");
+        h.app.library.search = "stale search".into();
+        h.app.library.remove_recent(&second);
+        wait(&mut h.app);
+        assert!(h.app.library.root.is_none());
+        assert!(h.app.library.current.as_os_str().is_empty());
+        assert!(h.app.library.listing.entries.is_empty());
+        assert!(h.app.library.search.is_empty());
+        assert!(!h.app.library.loading());
+        assert!(second.join("Contents").is_dir());
+        let mut restored = LibraryState::default();
+        restored.load(Some(&h.app.library.prefs()));
+        assert!(restored.root.is_none());
+        assert!(restored.recent_folders().is_empty());
+    }
+
+    #[test]
+    fn highlights_survive_folder_switches_refresh_and_restart() {
+        let mut h = Harness::new();
+        folder_picker(&mut h, None);
+        h.app.home.open = false;
+        let first = h.dir.join("First");
+        let second = h.dir.join("Second");
+        for folder in [&first, &second] {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(folder.join("Model.solidcraft"), b"untouched design").unwrap();
+        }
+        h.app.library.set_root(first.clone());
+        h.app.library.set_highlight(&first.join("Model.solidcraft"), Some(Highlight::Orange));
+        wait(&mut h.app);
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:highlight_indicator").is_some());
+        h.app.library.set_root(second.clone());
+        wait(&mut h.app);
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:highlight_indicator").is_none(), "same filename in another folder is independent");
+        h.app.library.set_root(first.clone());
+        wait(&mut h.app);
+        h.app.library.refresh();
+        wait(&mut h.app);
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:highlight_indicator").is_some());
+        let prefs = h.app.library.prefs();
+        h.app.library = LibraryState::default();
+        h.app.library.load(Some(&prefs));
+        wait(&mut h.app);
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:highlight_indicator").is_some());
+        assert_eq!(h.app.library.highlights.get(&first.join("Model.solidcraft")), Some(&Highlight::Orange));
+        for folder in [&first, &second] {
+            assert_eq!(std::fs::read(folder.join("Model.solidcraft")).unwrap(), b"untouched design");
+        }
+        for theme in [crate::theme::Tokens::light(), crate::theme::Tokens::dark()] {
+            for color in theme.library_highlights {
+                assert!(crate::theme::contrast_ratio(color, theme.field) >= 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn file_highlights_persist_by_full_path_and_tolerate_invalid_preferences() {
+        let mut state = LibraryState::default();
+        let first = Path::new("/CAD/Model.solidcraft");
+        let other = Path::new("/Other/Model.solidcraft");
+        state.set_highlight(first, Some(Highlight::Red));
+        state.set_highlight(other, Some(Highlight::Blue));
+        let mut restored = LibraryState::default();
+        restored.load(Some(&state.prefs()));
+        assert_eq!(restored.highlights, state.highlights);
+        restored.set_highlight(first, None);
+        assert_eq!(restored.highlights.get(other), Some(&Highlight::Blue));
+        assert!(!restored.highlights.contains_key(first));
+        restored.load(Some(&json!({"highlights":{"/valid":"purple","/bad":"chartreuse","":"red","/invalid":42}})));
+        assert_eq!(restored.highlights.len(), 1);
+        assert_eq!(restored.highlights.get(Path::new("/valid")), Some(&Highlight::Purple));
+        restored.load(Some(&json!({"root":null})));
+        assert!(restored.highlights.is_empty(), "old settings remain compatible");
+    }
+
+    #[test]
+    fn active_thumbnail_dot_follows_exact_file_and_active_tab() {
+        let mut h = Harness::new();
+        folder_picker(&mut h, None);
+        h.app.home.open = false;
+        let first = h.dir.join("Model.solidcraft");
+        let second = h.dir.join("Model copy.solidcraft");
+        for path in [&first, &second] {
+            std::fs::write(path, b"same preview").unwrap();
+        }
+        h.app.library.set_root(h.dir.clone());
+        wait(&mut h.app);
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:active_indicator").is_none());
+        h.app.session.path = Some(first.to_string_lossy().into_owned());
+        h.frames(3);
+        let first_dot = crate::scenario::rect_of("library:active_indicator").unwrap();
+        let entry_index = h.app.library.visible().iter().position(|entry| entry.path == first).unwrap();
+        assert!(crate::scenario::handle_at(&format!("library:entry:{entry_index}")).unwrap().distance(first_dot.center()) < 200.0);
+        let mut session = solidcraft_engine::Session::default();
+        session.path = Some(second.to_string_lossy().into_owned());
+        crate::documents::open_tab(&mut h.app, session).unwrap();
+        h.frames(3);
+        let second_dot = crate::scenario::rect_of("library:active_indicator").unwrap();
+        assert_ne!(first_dot, second_dot);
+        crate::documents::switch(&mut h.app, 0);
+        h.frames(3);
+        assert_eq!(crate::scenario::rect_of("library:active_indicator"), Some(first_dot));
+        h.app.session.path = Some(h.dir.join("Elsewhere/Model.solidcraft").to_string_lossy().into_owned());
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:active_indicator").is_none(), "same basename in another folder must not match");
+        h.app.session.path = None;
+        h.frames(3);
+        assert!(crate::scenario::rect_of("library:active_indicator").is_none());
+    }
+
+    #[test]
     fn folder_listing_places_newest_designs_first_and_folders_above_them() {
         let h = Harness::new();
         std::fs::create_dir(h.dir.join("Project")).unwrap();
@@ -691,6 +1179,34 @@ mod tests {
         }
         assert!(h.app.library.root.is_none());
         assert_eq!(std::fs::read_dir(&h.dir).unwrap().count(), before);
+    }
+
+    #[test]
+    fn choosing_folder_from_gear_collapses_history_but_cancel_preserves_it() {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.library.set_root(h.dir.clone());
+        folder_picker(&mut h, None);
+        h.frames(3);
+        h.step(&json!({"click":{"handle":"library:folders"}})).unwrap();
+        assert!(h.app.library.folders_expanded);
+        h.step(&json!({"click":{"handle":"library:settings"}})).unwrap();
+        crate::file_picker::tick(&mut h.app, &h.ctx);
+        h.frames(3);
+        assert!(h.app.library.folders_expanded);
+        assert_eq!(h.app.library.root.as_ref(), Some(&h.dir));
+        let selected = h.dir.join("Chosen folder");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::create_dir(selected.join("Visible contents")).unwrap();
+        folder_picker(&mut h, Some(selected.to_string_lossy().into_owned()));
+        h.step(&json!({"click":{"handle":"library:settings"}})).unwrap();
+        crate::file_picker::tick(&mut h.app, &h.ctx);
+        wait(&mut h.app);
+        h.frames(3);
+        assert_eq!(h.app.library.root.as_ref(), Some(&selected));
+        assert!(h.widget("Visible contents").is_some());
+        assert!(!h.app.library.folders_expanded);
+        assert!(h.app.library.folder_menu.is_none());
     }
 
     #[test]

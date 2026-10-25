@@ -445,6 +445,8 @@ pub struct IconColors {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
+    /// User-assigned document labels: red, orange, green, blue, purple.
+    pub library_highlights: [Color32; 5],
     /// Optional structural/control strokes. None retains each surface’s legacy styling.
     pub borders: Borders,
     /// File/start presentation, with explicit foreground/background pairs.

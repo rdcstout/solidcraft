@@ -1,5 +1,5 @@
 //! Thumbnail menu actions share the engine commands used by scripts and other frontends.
-use super::{Entry, open_entry};
+use super::{Entry, Highlight, open_entry};
 use crate::SolveApp;
 use serde_json::json;
 
@@ -46,6 +46,28 @@ pub(super) fn context_menu(app: &mut SolveApp, ui: &egui::Ui, response: &egui::R
             }
             if matches!(action, Action::Rename | Action::Reveal) {
                 ui.separator();
+            }
+            if action == Action::Reveal {
+                crate::ui_kit::Menu::button(ui, app.tr("library.highlight"), |ui| {
+                    ui.set_min_width(140.0);
+                    let current = app.library.highlights.get(&entry.path).copied();
+                    for choice in std::iter::once(None).chain(Highlight::ALL.into_iter().map(Some)) {
+                        let label = app.tr(choice.map(Highlight::label).unwrap_or("library.highlight_none"));
+                        let response = crate::ui_kit::list_picker(ui, label, label, current == choice);
+                        if let Some(color) = choice {
+                            let rect = response.rect;
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(rect.right_top() + egui::vec2(-12.0, 6.0), egui::vec2(4.0, 12.0)),
+                                1.0,
+                                color.color(),
+                            );
+                        }
+                        if response.clicked() {
+                            app.library.set_highlight(&entry.path, choice);
+                            ui.close();
+                        }
+                    }
+                });
             }
             let path = entry.path.to_str();
             let enabled = path.is_some()
@@ -111,6 +133,12 @@ fn execute(app: &mut SolveApp, entry: &Entry, action: Action, destination: Optio
     let result = app.run(command, json!({"path":path, "destination":destination}));
     match result {
         Ok(_) => {
+            if action != Action::Copy
+                && let Some(color) = app.library.highlights.remove(&entry.path)
+                && let Some(destination) = destination
+            {
+                app.library.set_highlight(destination, Some(color));
+            }
             // The Home recent list must not point at a path removed through this panel.
             if action != Action::Copy {
                 let new = destination.and_then(|p| p.to_str());
@@ -199,6 +227,59 @@ mod tests {
         let path = h.dir.join("MenuTest.solidcraft");
         std::fs::write(&path, solidcraft_engine::io::write_design(&solidcraft_engine::doc::Document::new("Menu Test"))).unwrap();
         Entry { path, name: "MenuTest.solidcraft".into(), folder: false }
+    }
+
+    #[test]
+    fn highlight_submenu_sets_replaces_and_clears_without_loading_or_writing_design() {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.services.pick_folder = Some(Box::new(|| Box::pin(std::future::ready(None))));
+        let e = entry(&h);
+        let before = std::fs::read(&e.path).unwrap();
+        h.app.library.set_root(h.dir.clone());
+        for _ in 0..200 {
+            h.app.library.poll(&h.ctx);
+            if !h.app.library.loading() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for choice in [Some(Highlight::Red), Some(Highlight::Purple), None] {
+            h.frames(3);
+            h.step(&json!({"click":{"handle":"library:entry:0"},"button":"right"})).unwrap();
+            h.frames(2);
+            let highlight_y = h.widget("Highlight").unwrap()[1];
+            assert!(h.widget("Move to Trash").unwrap()[1] < highlight_y);
+            assert!(highlight_y < h.widget("Show in Folder").unwrap()[1]);
+            h.step(&json!({"widget":"Highlight"})).unwrap();
+            h.frames(3);
+            let label = crate::i18n::tr(choice.map(Highlight::label).unwrap_or("library.highlight_none"));
+            assert!(h.widget(label).is_some(), "submenu must show {label}");
+            h.step(&json!({"widget":label})).unwrap();
+            h.frames(3);
+            assert_eq!(h.app.library.highlights.get(&e.path).copied(), choice);
+            assert_eq!(crate::scenario::rect_of("library:highlight_indicator").is_some(), choice.is_some());
+            assert!(!h.app.file_load.busy());
+            assert!(h.app.session.path.is_none());
+            assert_eq!(std::fs::read(&e.path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn successful_move_preserves_highlight_but_copy_does_not_steal_it() {
+        let mut h = Harness::new();
+        let e = entry(&h);
+        h.app.library.set_highlight(&e.path, Some(Highlight::Green));
+        let copied = h.dir.join("Copied.solidcraft");
+        assert!(execute(&mut h.app, &e, Action::Copy, Some(&copied)));
+        assert_eq!(h.app.library.highlights.get(&e.path), Some(&Highlight::Green));
+        assert!(!h.app.library.highlights.contains_key(&copied));
+        let moved = h.dir.join("Renamed.solidcraft");
+        assert!(execute(&mut h.app, &e, Action::Rename, Some(&moved)));
+        assert!(!h.app.library.highlights.contains_key(&e.path));
+        assert_eq!(h.app.library.highlights.get(&moved), Some(&Highlight::Green));
+        assert!(!execute(&mut h.app, &e, Action::Rename, Some(&copied)));
+        assert_eq!(h.app.library.highlights.get(&moved), Some(&Highlight::Green));
     }
 
     #[test]
