@@ -437,7 +437,7 @@ fn thumbnail_card(
         crate::scenario::publish_rect("library:highlight_indicator", marker);
         label.min.x += 10.0;
     }
-    ui.painter().with_clip_rect(label).text(label.left_top(), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(12.0), t.text);
+    ui.painter().with_clip_rect(label).text(label.left_top(), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(t.font_body), t.text);
     response
 }
 
@@ -1017,7 +1017,9 @@ mod tests {
         }
         for theme in [crate::theme::Tokens::light(), crate::theme::Tokens::dark()] {
             for color in theme.library_highlights {
-                assert!(crate::theme::contrast_ratio(color, theme.field) >= 3.0);
+                for ground in [theme.field, theme.hover] {
+                    assert!(crate::theme::contrast_ratio(color, ground) >= 3.0);
+                }
             }
         }
     }

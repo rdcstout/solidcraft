@@ -146,6 +146,8 @@ pub struct Harness {
     /// The last frame's platform output (with its accessibility tree: dialog widgets are found
     /// by their text there).
     pub output: egui::PlatformOutput,
+    /// The last frame's painted shapes.
+    pub shapes: Vec<egui::epaint::ClippedShape>,
     /// Files the scenario saves and opens live here; file pickers answer from it.
     pub dir: PathBuf,
     /// The file the next Open picker returns (a `choose_file` step).
@@ -183,6 +185,7 @@ impl Harness {
                 ctx
             },
             output: Default::default(),
+            shapes: Vec::new(),
             dir: scratch_dir(),
             next_file: Rc::new(RefCell::new(None)),
             queue: None,
@@ -237,6 +240,7 @@ impl Harness {
         // Nothing is painted: drop the frame's texture changes.
         out.textures_delta.clear();
         self.output = out.platform_output;
+        self.shapes = out.shapes;
     }
 
     pub fn frames(&mut self, n: usize) {
@@ -551,6 +555,13 @@ impl Harness {
             } else if let Some(how) = s.get("restart").and_then(Value::as_str) {
                 // "crash": the app dies (its autosave lock goes with it, the entry stays);
                 // "close": it closes normally. Then a new app starts on the same folders.
+                // Scenarios use a zero autosave interval: finish the latest checkpoint before
+                // the simulated crash, even if an older snapshot was still being written.
+                if how == "crash"
+                    && let Some(autosave) = self.app.autosave.as_mut()
+                {
+                    autosave.save(&self.app.session).map_err(|e| format!("autosave before simulated crash: {e}"))?;
+                }
                 let mut old = std::mem::replace(&mut self.app, SolveApp::new(Session::default(), Services::default()));
                 if how == "close" {
                     crate::recovery_ui::close(&mut old);
