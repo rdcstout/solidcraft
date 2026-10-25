@@ -909,6 +909,32 @@ fn contextual_tab(app: &SolveApp, tab: &str) -> bool {
     tab == "SKETCH" || (tab == "SHEET METAL" && crate::workspace::sheet_body(app).is_some())
 }
 
+/// How one ribbon tab is painted: its fill, its label colour and an outline
+/// (`Color32::TRANSPARENT` for none).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RibbonTabStyle {
+    fill: Color32,
+    ink: Color32,
+    outline: Color32,
+}
+
+/// A contextual tab (Sketch while editing, Sheet Metal for a sheet body) is the loudest tab
+/// when it is selected: the solid accent pill. Unselected, it looks like any unselected tab
+/// with its accent as an outline, so it still marks the context without outshining the
+/// selected tab. Ordinary tabs use the soft accent when selected and the hover colour when
+/// hovered.
+fn ribbon_tab_style(t: &Tokens, tab: &str, contextual: bool, active: bool, hovered: bool) -> RibbonTabStyle {
+    let accent = crate::theme::TabAccent::for_tab(t, tab);
+    let idle = if hovered { t.hover } else { Color32::TRANSPARENT };
+    let (fill, ink, outline) = match (contextual, active) {
+        (true, true) => (accent.color, accent.on_fill(t), Color32::TRANSPARENT),
+        (true, false) => (idle, t.text, accent.color),
+        (false, true) => (accent.soft, accent.ink, Color32::TRANSPARENT),
+        (false, false) => (idle, t.text, Color32::TRANSPARENT),
+    };
+    RibbonTabStyle { fill, ink, outline }
+}
+
 fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
     let t = Tokens::get();
     let tabs = crate::workspace::visible_tabs(app);
@@ -962,31 +988,9 @@ fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
                     }
                     let response = ui.interact(tr, ui.id().with(("tab", tab)), Sense::click());
                     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, ribbon_label(app, tab)));
-                    let accent = crate::theme::TabAccent::for_tab(&t, tab);
-                    let fill = if contextual {
-                        accent.color
-                    } else if active {
-                        accent.soft
-                    } else if response.hovered() {
-                        t.hover
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    ui.painter().rect_filled(tr, corner, fill);
-                    ribbon_text(
-                        ui,
-                        tr.center(),
-                        &ribbon_label(app, tab),
-                        t.font_button,
-                        if contextual {
-                            accent.on_fill(&t)
-                        } else if active {
-                            accent.ink
-                        } else {
-                            t.text
-                        },
-                        active || contextual,
-                    );
+                    let style = ribbon_tab_style(&t, tab, contextual, active, response.hovered());
+                    ui.painter().rect(tr, corner, style.fill, Stroke::new(1.0, style.outline), egui::StrokeKind::Inside);
+                    ribbon_text(ui, tr.center(), &ribbon_label(app, tab), t.font_button, style.ink, active || contextual);
                     if ui.clip_rect().contains(tr.center()) {
                         crate::scenario::publish_target(&format!("tab:{tab}"), tr);
                         crate::scenario::publish_rect(&format!("toolbar_tab:{tab}"), tr);
@@ -1829,8 +1833,11 @@ fn sketch_create_menu(
     egui::ScrollArea::vertical().id_salt("sketch_create_rows").max_height(room).show(ui, |ui| {
         for f in crate::sketch_families::FAMILIES {
             let variants: Vec<_> = f.commands.iter().filter_map(|id| cmds.iter().find(|c| c.id == *id).copied()).collect();
-            if !variants.is_empty() {
-                let response = crate::ui_kit::Menu::button(ui, app.tr_label(f.label).to_string(), |ui| {
+            if let Some(first) = variants.first() {
+                // The row translates its own label.
+                let mut item = crate::ui_kit::MenuItem::new(f.label, f.label, first.icon);
+                item.submenu = true;
+                let response = crate::ui_kit::Menu::item_button(ui, &item, |ui| {
                     dropdown_keys(app, ui, &variants);
                     sketch_menu_rows(app, ui, &variants, menu, toggle);
                 });
@@ -2033,7 +2040,11 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                     });
                 }
                 _ if !shown => {}
-                Key::Z => drop(app.run("edit.undo", json!({}))),
+                Key::Z => {
+                    if !crate::tools::undo_spline_point(app) {
+                        drop(app.run("edit.undo", json!({})));
+                    }
+                }
                 Key::Y => drop(app.run("edit.redo", json!({}))),
                 // Copy, Cut and Paste (`edit_clipboard::handle`).
                 Key::C | Key::X | Key::V if !mods.shift && !mods.alt => {}
@@ -2105,6 +2116,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                 crate::context_menu::rename_selection(app, at);
             }
             Key::F6 => app.animate_view("fit"),
+            Key::Backspace if crate::tools::undo_spline_point(app) => {}
             Key::Delete | Key::Backspace => {
                 if !crate::timeline_left::delete_selected_folders(app) {
                     crate::viewport::delete_selection(app);
@@ -2776,6 +2788,43 @@ mod home_tests {
 mod dropdown_tests {
     use super::*;
 
+    #[test]
+    fn sketch_create_families_have_icons_and_open_their_variants() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.frames(4);
+        h.step(&json!({"click":{"handle":"panel:SKETCH:CREATE"}})).unwrap();
+        h.frames(4);
+        let family = crate::scenario::rect_of("menu:Line").expect("Line is a shared menu row");
+        assert!(family.contains(crate::scenario::handle_at("create_family:Line").unwrap()));
+        h.step(&json!({"click":{"handle":"create_family:Line"}})).unwrap();
+        h.frames(4);
+        for id in ["sketch.line", "sketch.line.midpoint"] {
+            assert!(crate::scenario::handle_at(&format!("dropdown:{id}")).is_some(), "missing variant {id}");
+        }
+        h.step(&json!({"click":{"handle":"dropdown:sketch.line.midpoint"}})).unwrap();
+        assert_eq!(h.app.tool.as_ref().map(|tool| tool.cmd), Some("sketch.line.midpoint"));
+    }
+
+    #[test]
+    fn sketch_create_family_rows_paint_the_first_variants_icons() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let cmds: Vec<_> = solidcraft_engine::command_specs().into_iter().filter(|c| c.tab == "SKETCH" && c.panel == "CREATE").collect();
+        crate::icon_svg::audit::start();
+        let _ = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+            sketch_create_menu(&mut h.app, ui, &cmds, &mut None, &mut None);
+        });
+        let requested = crate::icon_svg::audit::take();
+        crate::icon_svg::audit::stop();
+        for family in crate::sketch_families::FAMILIES {
+            let first = solidcraft_engine::find_command(family.commands[0]).unwrap();
+            assert!(!first.icon.is_empty());
+            assert!(requested.iter().any(|icon| icon.name == first.icon && !icon.placeholder), "{} must paint {}", family.label, first.icon);
+        }
+    }
+
     /// A drop-down taller than the window stops at its bottom and scrolls: the last row is
     /// reached with the arrow keys and comes into view.
     #[test]
@@ -2963,6 +3012,54 @@ mod app_bar_tests {
 #[cfg(test)]
 mod ribbon_label_tests {
     use super::*;
+
+    fn tab_test_themes() -> Vec<Tokens> {
+        let mut themes = Vec::new();
+        for dark in [false, true] {
+            for vision in crate::theme::ColorVision::ALL {
+                themes.push(Tokens::themed(dark, vision));
+            }
+        }
+        themes.extend(crate::theme_files::builtin().iter().map(crate::theme_files::resolve));
+        themes
+    }
+
+    #[test]
+    fn a_selected_contextual_tab_stands_out_and_an_unselected_one_is_outlined() {
+        for t in tab_test_themes() {
+            for tab in ["SKETCH", "SHEET METAL"] {
+                let accent = crate::theme::TabAccent::for_tab(&t, tab);
+                for hovered in [false, true] {
+                    let active = ribbon_tab_style(&t, tab, true, true, hovered);
+                    let inactive = ribbon_tab_style(&t, tab, true, false, hovered);
+                    assert_eq!(active, RibbonTabStyle { fill: accent.color, ink: accent.on_fill(&t), outline: Color32::TRANSPARENT });
+                    assert_eq!(inactive, RibbonTabStyle { outline: accent.color, ..ribbon_tab_style(&t, tab, false, false, hovered) });
+                    assert!(crate::theme::contrast_ratio(active.ink, active.fill) >= 4.5, "{tab}: selected text must remain readable");
+                    // The selected contextual tab is the solid pill; the unselected one never is.
+                    assert!(
+                        crate::theme::contrast_ratio(active.fill, t.toolbar)
+                            > crate::theme::contrast_ratio(if hovered { t.hover } else { t.toolbar }, t.toolbar),
+                        "{tab}: the selected tab must be the more prominent one"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_tabs_keep_their_selected_hovered_and_idle_colors() {
+        for t in tab_test_themes() {
+            for tab in ["MODEL", "SURFACE", "SHEET METAL"] {
+                let accent = crate::theme::TabAccent::for_tab(&t, tab);
+                for hovered in [false, true] {
+                    let none = Color32::TRANSPARENT;
+                    assert_eq!(ribbon_tab_style(&t, tab, false, true, hovered), RibbonTabStyle { fill: accent.soft, ink: accent.ink, outline: none });
+                    let idle = if hovered { t.hover } else { none };
+                    assert_eq!(ribbon_tab_style(&t, tab, false, false, hovered), RibbonTabStyle { fill: idle, ink: t.text, outline: none });
+                }
+            }
+        }
+    }
 
     #[test]
     fn ribbon_weight_is_painted_once_at_a_pixel_aligned_origin() {

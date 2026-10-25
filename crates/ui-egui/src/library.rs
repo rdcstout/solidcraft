@@ -1567,6 +1567,8 @@ mod tests {
         wait(&mut h.app);
         assert_eq!(h.app.library.current, h.dir);
         h.app.library.collapsed = true;
+        h.app.library.set_highlight(&h.dir.join("labelled.solidcraft"), Some(Highlight::Green));
+        h.app.home.forget("removed-from-home.solidcraft");
         let prefs = h.app.prefs();
         let mut restored = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
         restored.load_prefs(&prefs);
@@ -1574,6 +1576,8 @@ mod tests {
         assert_eq!(restored.library.root.as_ref(), Some(&h.dir));
         // Root restoration must preserve the saved collapsed setting.
         assert!(restored.library.collapsed);
+        assert_eq!(restored.library.highlights, h.app.library.highlights);
+        assert_eq!(restored.home.forgotten, h.app.home.forgotten);
         folder_picker(&mut h, None);
         choose_folder(&mut h.app);
         crate::file_picker::tick(&mut h.app, &h.ctx);

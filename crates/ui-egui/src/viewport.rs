@@ -34,6 +34,10 @@ mod removed_later_tests;
 #[path = "viewport_plane_target_tests.rs"]
 mod plane_target_tests;
 
+#[cfg(test)]
+#[path = "viewport_refine_wait_tests.rs"]
+mod refine_wait_tests;
+
 #[path = "navigation_cube.rs"]
 mod navigation_cube;
 
@@ -76,6 +80,8 @@ pub struct ViewportState {
     pub(crate) lod: std::sync::Mutex<crate::display_lod::Lod>,
     /// The view and model the refinement was last chosen for.
     lod_view: u64,
+    /// Refinement waits for the camera to stop ([`REFINE_STILL_MS`]).
+    lod_rest: CameraRest,
     /// Each body mesh's box (the mesh held, so its address stays its own), from the last state.
     mesh_bounds: std::sync::Mutex<MeshBounds>,
     /// Each shown body mesh's section index for the cut's normal (the mesh held, so its address
@@ -300,11 +306,16 @@ fn rgba(c: Rgb) -> [u8; 4] {
     [c.0, c.1, c.2, 255]
 }
 
-pub fn scene_radius(app: &SolveApp) -> f64 {
+fn scene_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
     let mut b = model_bounds(app);
     if !app.preview.bounds.is_empty() {
         b = b.union(&app.preview.bounds);
     }
+    b
+}
+
+pub fn scene_radius(app: &SolveApp) -> f64 {
+    let b = scene_bounds(app);
     let r = if b.is_empty() { 50.0 } else { b.diagonal() * 0.5 + b.center().dist(app.cam.target) };
     r.max(app.cam.half_height() * 2.0).max(10.0)
 }
@@ -313,7 +324,7 @@ pub fn projection(app: &SolveApp, rect: Rect) -> Proj {
     let mut cam = app.cam;
     cam.fov = if app.perspective_view() { 0.6 } else { 0.0 };
     let aspect = rect.width() as f64 / rect.height().max(1.0) as f64;
-    Proj { cam, vp: cam.view_proj(aspect, scene_radius(app)), rect }
+    Proj { cam, vp: cam.view_proj_bounds(aspect, &scene_bounds(app)), rect }
 }
 
 /// Sketches drawn in the viewport: the active one, and finished ones not yet used by a feature.
@@ -550,6 +561,27 @@ fn drawn_mesh(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> std::syn
     if current() == DisplayQuality::Normal { b.mesh() } else { b.plan_mesh().unwrap_or_else(|| b.mesh()) }
 }
 
+/// How long (ms) the camera must stand still before display refinements are chosen and swapped in.
+const REFINE_STILL_MS: f64 = 200.0;
+
+/// The camera the last frame had and when it last differed from the one before (ms).
+#[derive(Default)]
+struct CameraRest {
+    camera: u64,
+    moved_at: f64,
+}
+
+impl CameraRest {
+    /// Notes this frame's camera (a hash of the view) at `now` (ms); how much longer (ms) the
+    /// camera has to stand still, 0 once it has for [`REFINE_STILL_MS`].
+    fn wait(&mut self, camera: u64, now: f64) -> f64 {
+        if camera != self.camera {
+            *self = CameraRest { camera, moved_at: now };
+        }
+        (REFINE_STILL_MS - (now - self.moved_at)).max(0.0)
+    }
+}
+
 /// Choose which bodies to draw finer than the chosen display quality for this view (#1320):
 /// each shown body's screen-space error from its box on screen, refinements planned off the UI
 /// thread and swapped in when ready. Keeps repainting while refinements are being planned.
@@ -563,6 +595,15 @@ fn update_refinement(app: &mut SolveApp, ctx: &egui::Context, proj: &Proj) {
     scene_key(app).hash(&mut h);
     crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
     let view = h.finish();
+    // A moving camera is left alone: every refinement swapped in rebuilds and uploads the whole
+    // model scene, which in a large assembly takes tens of milliseconds a time. The bodies keep
+    // the step they have until the camera has stood still for [`REFINE_STILL_MS`].
+    let camera = crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point());
+    let wait = app.viewport.lod_rest.wait(camera, crate::now_ms());
+    if wait > 0.0 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(wait as u64 + 5));
+        return;
+    }
     // While refinements are being planned, the view standing still: only collect finished ones.
     if view == app.viewport.lod_view {
         let (busy, finished) = app.viewport.lod.lock().map_or((false, false), |mut l| {
@@ -1639,11 +1680,12 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
         }
         // 3D sketch curves (paths for sweeps and pipes).
         for w in &ss.sketch.wires {
+            let straight = w.fit.len() == 2;
             let pts: Vec<Pos2> = w.pts.iter().filter_map(|q| proj.to_screen(*q)).collect();
             for seg in pts.windows(2) {
                 let dd = seg_dist(pos, seg[0], seg[1]) - bonus;
                 if dd < 6.0 && bestc.wants(dd) {
-                    bestc.offer(dd, Hit::SketchCurve { sketch: sid, id: w.id.clone(), straight: false });
+                    bestc.offer(dd, Hit::SketchCurve { sketch: sid, id: w.id.clone(), straight });
                 }
             }
         }
@@ -1872,7 +1914,6 @@ fn feature_parts(app: &SolveApp, id: u64, shown_only: bool) -> Vec<Sel> {
         return Vec::new();
     }
     let st = crate::open_meshing::shown_world(app);
-    let prefix = format!("F{id}:");
     let mut out = Vec::new();
     for b in &st.bodies {
         if shown_only && (!app.session.body_visible(&b.name) || app.preview.effective_replaced().contains(&b.name)) {
@@ -1884,7 +1925,7 @@ fn feature_parts(app: &SolveApp, id: u64, shown_only: bool) -> Vec<Sel> {
         }
         let names = solidcraft_engine::doc::naming::face_names(b);
         let m = b.mesh();
-        for (index, _) in names.iter().enumerate().filter(|(_, n)| n.starts_with(&prefix)) {
+        for (index, _) in names.iter().enumerate().filter(|(_, n)| solidcraft_engine::doc::persistent_name::made_by(n) == Some(id)) {
             if let Some(point) = m.triangles.iter().zip(&m.tri_face).find_map(|(t, f)| {
                 if *f as usize != index {
                     return None;
@@ -3665,6 +3706,15 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         let picture = crate::space_mouse_model::corner_rect(area, position, &obstacles);
         crate::space_mouse_model::corner(ui, picture, calibration, app.space_mouse.raw.into());
     }
+    // Last, so it sits over the overlays; only where a click would reach the model.
+    let badge_at = hover.filter(|p| {
+        inside
+            && !navigating
+            && resp.hovered()
+            && ui.ctx().layer_id_at(*p).is_none_or(|layer| layer == ui.layer_id())
+            && !crate::shell::covered(app, *p)
+    });
+    crate::tool_cursor::show(app, &painter, badge_at);
 }
 
 fn paint_box_selection(painter: &egui::Painter, bx: BoxSel, sketch: bool) {
@@ -4760,8 +4810,8 @@ fn nav_bar(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     ui.data_mut(|d| d.insert_temp(menu_id, menu_open));
 }
 
-/// The View settings above the navigation bar's last button: grid, ground shadow and the agent
-/// cursor (#35). False once it should close (a click outside it).
+/// The View settings above the navigation bar's last button: grid, ground shadow, the tool at
+/// the cursor and the agent cursor (#35). False once it should close (a click outside it).
 fn view_menu(app: &mut SolveApp, ui: &mut egui::Ui, button: Rect) -> bool {
     let t = crate::theme::Tokens::get();
     // A preset dropdown extends beyond this menu; let it consume its own clicks.
@@ -4781,6 +4831,8 @@ fn view_menu(app: &mut SolveApp, ui: &mut egui::Ui, button: Rect) -> bool {
             crate::ui_kit::checkbox(ui, crate::i18n::tr_label("Grid"), &mut app.ui.show_grid);
             crate::ui_kit::checkbox(ui, crate::i18n::tr_label("Ground shadow"), &mut app.ui.ground_shadow);
             crate::prefs::ambient_occlusion_checkbox(app, ui, "Ambient occlusion");
+            let tool = crate::ui_kit::checkbox(ui, crate::i18n::tr_label("Show tool at cursor"), &mut app.ui.tool_cursor);
+            crate::scenario::publish_handle("view:tool_cursor", tool.rect.center());
             ui.separator();
             let s = &mut app.ui.agent_cursor;
             let show = crate::ui_kit::checkbox(ui, crate::i18n::tr_label("Show Agent Cursor"), &mut s.show);
@@ -4827,6 +4879,60 @@ mod tests {
         assert_eq!(scene.shadow.len(), 48 * 5 * 3 * crate::gpu::TRI_SIZE, "all shadow rings are retained");
         assert!(scene.shadow.as_chunks::<{ crate::gpu::TRI_SIZE }>().0.iter().any(|v| v.get(27).is_some_and(|a| *a > 0)));
         Ok(())
+    }
+
+    #[test]
+    fn straight_3d_wire_is_offered_as_an_axis_but_spline_is_refused() {
+        for (command, points, straight) in [
+            ("sketch.line3d", json!([[10, 20, 30], [30, 20, 30]]), true),
+            ("sketch.spline3d", json!([[10, 20, 30], [20, 25, 40], [30, 20, 30]]), false),
+            ("sketch.spline3d", json!([[10, 20, 30], [20, 20, 30], [30, 20, 30]]), false),
+        ] {
+            let mut s = solidcraft_engine::Session::default();
+            s.execute("sketch.create", &json!({"plane":"XZ", "offset":7})).unwrap();
+            s.execute("sketch.options", &json!({"sketch_3d":true})).unwrap();
+            let id = s.execute(command, &json!({"points":points})).unwrap()["curves"][0].as_str().unwrap().to_string();
+            s.execute("sketch.finish", &json!({})).unwrap();
+            let mut app = SolveApp::new(s, crate::Services::default());
+            app.fit_view();
+            let st = app.session.world_state();
+            let wire = &st.sketches[0].sketch.wires[0];
+            let at = (wire.pts[0] + wire.pts[1]) * 0.5;
+            let proj = projection(&app, Rect::from_min_size(Pos2::ZERO, vec2(800., 600.)));
+            let hits = pick_all(&app, &proj, proj.to_screen(at).unwrap());
+            let hit = hits.iter().find(|h| matches!(h, Hit::SketchCurve { id: picked, .. } if picked == &id)).unwrap();
+            let axis = crate::selection::SelInput::new("Axis", crate::selection::AXES, false);
+            assert_eq!(axis.accepts(hit, |_, _| false).is_some(), straight, "{hit:?}");
+            let selected = Sel::SketchCurve { id };
+            assert_eq!(crate::dialogs::axis_of(&app, &selected).is_some(), straight);
+        }
+    }
+
+    #[test]
+    fn plane_at_angle_uses_3d_wire_endpoints_in_model_space() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("sketch.create", &json!({"plane":"XZ", "offset":7})).unwrap();
+        s.execute("sketch.options", &json!({"sketch_3d":true})).unwrap();
+        let id = s.execute("sketch.line3d", &json!({"points":[[10,20,30],[30,20,30]]})).unwrap()["curves"][0].as_str().unwrap().to_string();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        let selected = Sel::SketchCurve { id };
+        let (origin, dir) = crate::dialogs::axis_of(&app, &selected).unwrap();
+        assert!(origin.dist(Vec3::new(10., 20., 30.)) < 1e-9);
+        assert!(dir.dist(Vec3::X) < 1e-9);
+        let mut dialog = crate::dialogs::Dialog::for_command(&app, "construct.plane.at_angle").unwrap();
+        dialog.inputs[0].items = vec![Sel::Plane { name: "XY".into() }];
+        dialog.inputs[1].items = vec![selected];
+        if let crate::dialogs::Kind::AnglePlane { angle } = &mut dialog.kind {
+            *angle = "90 deg".into();
+        }
+        for (command, params) in crate::dialogs::apply_commands(&app, &dialog).unwrap() {
+            app.run(&command, params).unwrap();
+        }
+        let planes = solidcraft_engine::view::construction_planes(&app.session);
+        let plane = &planes.last().unwrap().2;
+        assert!(plane.normal().dist(-Vec3::Y) < 1e-9);
+        assert!(plane.origin.dist(Vec3::new(0., 50., 10.)) < 1e-9, "{plane:?}");
     }
 
     /// Every tangent seam Continuity Analysis reports keeps its colour while the pointer rests on
@@ -8561,6 +8667,54 @@ mod grid_plane_tests {
         }
         app.ui.show_grid = true;
         assert!(!grid(&app).is_empty());
+    }
+
+    #[test]
+    fn imported_scene_projection_toggle_keeps_front_components_in_clip_range() {
+        use solidcraft_engine::doc::{Document, FeatureKind, MeshData};
+        let mut doc = Document::default();
+        let meshes = [-10_000.0, 10_000.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, y)| MeshData {
+                name: format!("Panel {i}"),
+                positions: vec![-0.25, y, -0.25, 0.25, y, -0.25, 0.0, y, 0.25].into(),
+                triangles: vec![0, 1, 2].into(),
+                color: None,
+            })
+            .collect();
+        doc.add_feature(FeatureKind::MeshImport { file: "synthetic.stl".into(), meshes }, Some("Panels")).unwrap();
+        let mut app = SolveApp::new(solidcraft_engine::Session::new(doc), crate::Services::default());
+        app.cam.yaw = 0.0;
+        app.cam.pitch = 0.0;
+        app.fit_view();
+        app.cancel_view_animation();
+        app.cam.distance = 10_002.0;
+        assert_eq!(app.session.world_state().bodies.len(), 2);
+        let camera = app.cam;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0));
+        let original = projection(&app, rect).vp;
+        for shadow in [false, true] {
+            app.ui.ground_shadow = shadow;
+            for perspective in [false, true, false] {
+                app.ui.perspective = perspective;
+                let proj = projection(&app, rect);
+                for body in &app.session.world_state().bodies {
+                    let (mesh, _) = body.mesh_in_place();
+                    assert_eq!(mesh.positions.len(), 3);
+                    for p in &mesh.positions {
+                        let c = proj.vp.apply(*p);
+                        assert!(c.iter().all(|v| v.is_finite()));
+                        assert!(c[3] > 0.0 && (0.0..=c[3]).contains(&c[2]), "shadow={shadow}, perspective={perspective}, {p:?}: {c:?}");
+                        assert!(c[0].abs() <= c[3] && c[1].abs() <= c[3]);
+                    }
+                }
+                assert_eq!(app.cam, camera, "changing projection preserves the orbit camera");
+                if !perspective {
+                    assert_eq!(proj.vp, original);
+                }
+            }
+        }
     }
 
     /// A sketch is drawn in a parallel view even when the preference asks for perspective; the

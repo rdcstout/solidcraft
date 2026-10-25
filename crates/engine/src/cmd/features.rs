@@ -10,7 +10,7 @@ use solidcraft_doc::{Dir, FacePick, Position};
 use solidcraft_geom::Vec3;
 
 use super::{CommandSpec, not_in_sketch};
-use crate::params::{bad, bool_, expr, req_expr, str_, string_list, vec2, vec3};
+use crate::params::{bad, bool_, expr, expr_problem, req_expr, str_, string_list, vec2, vec3};
 use crate::schema::features::{BoxParams, ExtrudeParams, FeatureResult};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
@@ -68,7 +68,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SOLID", "CREATE")
         .icon("hole")
         .key("H")
-        .params("position: [x,y,z] on a face (numbers, or length expressions the hole follows) | sketch + points: [sketch point ids] (one hole each, perpendicular to the sketch, into the material on whichever side of the sketch plane it is) | sketch alone (every sketch point: standalone points and circle centres); flip?: bool (sketch points: drill to the other side); single?: bool (with one sketch point: a Single hole that follows the point, drilled into the face there); direction?: [x,y,z] (default: into the face, against its outward normal; one that leaves the face is mirrored into it; ignored with sketch points unless single); diameter | thread (a tapped hole: metric major minus pitch or tabulated UNC/UNF, G or Rp cut-tap drill) | clearance: \"M6\" with fit?: close|normal|loose (ISO 273); depth? (default through all) | to?: [x,y,z] (To Object: drill to that face or point); references?: [{edge: [x,y,z] on a straight edge of the face, distance: expr}] (at most two; the centre goes that far from each edge's line, in the face's plane, and follows the edges; with a numeric position only); type?: simple|drilled|counterbore|countersink; tip_angle?; cb_diameter?, cb_depth?; cs_diameter?, cs_angle?; thread?: \"M6\" or \"1/4-20 UNC\" (cosmetic); targets?: [body] (the bodies to drill; holes at the points of a sketch on a body's face default to that body, found along the holes' direction on it alone; explicit targets or participants override, [\"*\"] every body)"),
+        .params("position: [x,y,z] on a face (numbers, or length expressions the hole follows) | sketch + points: [sketch point ids] (one hole each, perpendicular to the sketch, into the material on whichever side of the sketch plane it is) | sketch alone (every sketch point: standalone points and circle centres); flip?: bool (sketch points: drill to the other side); single?: bool (with one sketch point: a Single hole that follows the point, drilled into the face there); direction?: [x,y,z] (default: into the face, against its outward normal; one that leaves the face is mirrored into it; ignored with sketch points unless single); diameter | thread (a tapped hole: metric major minus pitch or tabulated UNC/UNF, G or Rp cut-tap drill) | clearance: \"M6\" with fit?: close|normal|loose (ISO 273); depth? (default through all) | to?: [x,y,z] (To Object: drill to that face or point); references?: [{edge: [x,y,z] on a straight edge of the face, distance: expr}] (at most two; the centre goes that far from each edge's line, in the face's plane, and follows the edges; with a numeric position only); type?: simple|drilled|counterbore|countersink; tip_angle?; cb_diameter?, cb_depth?; cs_diameter?, cs_angle?; thread?: \"M6\" or \"1/4-20 UNC\" (cosmetic); thread_depth?: positive length independent of drill depth (default: full useful cylindrical wall; must fit that wall); targets?: [body] (the bodies to drill; holes at the points of a sketch on a body's face default to that body, found along the holes' direction on it alone; explicit targets or participants override, [\"*\"] every body)"),
     CommandSpec::new("solid.pipe", "Pipe", pipe)
         .at("SOLID", "CREATE")
         .icon("pipe")
@@ -208,10 +208,18 @@ fn auto_operation_in(s: &Session, p: &Value, world_faces: bool) -> Option<&'stat
     } else {
         extrude_base(s, p)?
     };
+    // The extrude starts at its From Object or start offset, not at the profile: probe from
+    // there (#467). To an object it then reaches only from that start.
+    let start = match p.get("from").and_then(vec3) {
+        Some(from) if grouped.is_none() => (from - base).dot(n),
+        _ => expr(p, "start_offset").and_then(|e| s.doc.eval(&e, Kind::Length).ok()).unwrap_or(0.0),
+    };
+    let start = if start.is_finite() { start } else { 0.0 };
+    let base = base + n * start;
     let d = if grouped.is_some() && p.get("to").is_some() {
         (p.get("to").and_then(vec3)? - base).dot(n)
     } else if let Some(d) = extrude_reach(s, p) {
-        d
+        if p.get("to").is_some() { d - start } else { d }
     } else {
         through_all_reach(&st, p, base)?
     };
@@ -365,7 +373,7 @@ pub(super) fn stable_profiles(s: &Session, kind: &mut FeatureKind) -> Result<()>
             }
             ProfileSel::All => continue,
         };
-        let captured = solidcraft_doc::capture_profile_selection(ss, &indices)?;
+        let captured = solidcraft_doc::capture_profile_selection(ss, &drawn_profile_regions(ss, &indices))?;
         *sel = match captured {
             ProfileSel::OffsetBoundaries { associations }
                 if associations.iter().any(|id| {
@@ -394,6 +402,82 @@ pub(super) fn stable_profiles(s: &Session, kind: &mut FeatureKind) -> Result<()>
         };
     }
     Ok(())
+}
+
+/// The regions a picked profile stands for.
+///
+/// A drawn profile cut by reference geometry that crosses it (the projected outline of the face
+/// a sketch is on) is several regions of the sketch's graph, and picking one of them takes the
+/// whole drawn profile (#5302): the regions that share a drawn curve with the picked one are
+/// the parts of that outline, split by the reference geometry crossing it. Reference geometry
+/// that stays inside the drawn profile (the rim of a counterbored hole) bounds an inner region
+/// of it, a real boundary of the material, so the pick keeps its own region. The drawn profiles
+/// are the disjoint faces of the drawn graph, so a drawn hole keeps filling only itself
+/// (#5176).
+fn drawn_profile_regions(ss: &solidcraft_doc::SolvedSketch, indices: &[usize]) -> Vec<usize> {
+    const MAX_PROFILES: usize = 10_000;
+    if indices.is_empty() || indices.len() > MAX_PROFILES || ss.profiles.len() > MAX_PROFILES {
+        return indices.to_vec();
+    }
+    let drawn = solidcraft_sketch::find_drawn_profiles(&ss.sketch);
+    if drawn.is_empty() || drawn.len() >= ss.profiles.len() {
+        return indices.to_vec();
+    }
+    // The curves the user drew: the drawn profiles are made of them, the reference geometry is
+    // not part of them.
+    let drawn_curves: std::collections::BTreeSet<&str> = ss
+        .sketch
+        .curves
+        .iter()
+        .enumerate()
+        .filter(|(index, curve)| {
+            !curve.construction && !curve.centerline && !curve.infinite && (!ss.sketch.is_linked_curve(*index) || ss.sketch.is_text_curve(*index))
+        })
+        .map(|(_, curve)| curve.id.as_str())
+        .collect();
+    let mut out: Vec<usize> = Vec::with_capacity(indices.len());
+    for index in indices {
+        let Some(picked) = ss.profiles.get(*index) else { continue };
+        // The drawn profile the picked region belongs to: the region around it that the drawn
+        // geometry alone bounds.
+        let probe = picked.region.interior_point();
+        let Some(owner) = drawn.iter().find(|profile| profile.region.contains(probe)) else {
+            out.push(*index);
+            continue;
+        };
+        // The drawn curves the picked region is bounded by.
+        let picked_curves: std::collections::BTreeSet<&str> = picked
+            .outer_curves
+            .iter()
+            .chain(picked.hole_curves.iter().flatten())
+            .map(String::as_str)
+            .filter(|id| drawn_curves.contains(id))
+            .collect();
+        if picked_curves.is_empty() {
+            out.push(*index);
+            continue;
+        }
+        // The regions of the drawn profile that share a drawn curve with the picked one: the
+        // parts of the same outline, cut apart by reference geometry crossing it.
+        let pieces: Vec<usize> = ss
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| owner.region.contains(profile.region.interior_point()))
+            .filter(|(_, profile)| {
+                profile.outer_curves.iter().chain(profile.hole_curves.iter().flatten()).any(|id| picked_curves.contains(id.as_str()))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if pieces.is_empty() {
+            out.push(*index);
+        } else {
+            out.extend(pieces);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 pub(crate) fn profiles(p: &Value, cmd: &str) -> Result<ProfileSel> {
@@ -1203,8 +1287,8 @@ fn press_pull(s: &mut Session, p: &Value) -> Result<Value> {
         && super::face::face_is_planar(s, fp) == Some(false)
     {
         let name = solidcraft_doc::naming::face_names_at(&s.model.state(), &[fp]).into_iter().next().unwrap_or_default();
-        let fid = name.strip_prefix('F').and_then(|r| r.split(':').next()).and_then(|x| x.parse::<u64>().ok());
-        if name.contains(":blend") {
+        let fid = solidcraft_doc::persistent_name::made_by(&name);
+        if solidcraft_doc::persistent_name::is_blend(&name) {
             let f = fid.and_then(|id| s.doc.feature(id)).cloned().ok_or_else(|| bad(cmd, "the blend's feature is gone"))?;
             let (key, old) = match &f.kind {
                 FeatureKind::Fillet { radius, .. } => ("radius", radius.clone()),
@@ -1978,6 +2062,19 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
             fine_only_hint(t).unwrap_or_else(|| format!("unknown tapped thread `{t}` (ISO metric or a catalogued UNC/UNF, G or Rp size)")),
         ));
     }
+    let thread_depth = match p.get("thread_depth") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(req_expr(cmd, p, "thread_depth")?),
+    };
+    if let Some(d) = &thread_depth {
+        if thread.is_none() {
+            return Err(bad(cmd, "`thread_depth` requires `thread` (a tapped hole)"));
+        }
+        let depth = s.doc.eval(d, Kind::Length).map_err(|e| bad(cmd, format!("`thread_depth`: {e}")))?;
+        if !depth.is_finite() || depth <= 0.0 {
+            return Err(bad(cmd, "`thread_depth` must be finite and positive"));
+        }
+    }
     // A position given as length expressions (#1678), say `["leg_h*0.4", "width/2", "t"]`: kept,
     // so the hole follows the parameters; drilled where they evaluate now.
     let at: Option<solidcraft_doc::PointExpr> = match p.get("position").and_then(Value::as_array) {
@@ -2074,10 +2171,13 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
             _ => solidcraft_doc::HoleKind::Simple,
         },
         "drilled" => solidcraft_doc::HoleKind::Drilled { tip_angle: expr(p, "tip_angle").unwrap_or_else(|| "118 deg".into()) },
-        "counterbore" => solidcraft_doc::HoleKind::Counterbore { cb_diameter: get("cb_diameter")?, cb_depth: get("cb_depth")? },
+        "counterbore" => {
+            solidcraft_doc::HoleKind::Counterbore { cb_diameter: get("cb_diameter")?, cb_depth: get("cb_depth")?, tip_angle: expr(p, "tip_angle") }
+        }
         "countersink" => solidcraft_doc::HoleKind::Countersink {
             cs_diameter: get("cs_diameter")?,
             cs_angle: expr(p, "cs_angle").unwrap_or_else(|| "90 deg".into()),
+            tip_angle: expr(p, "tip_angle"),
         },
         other => return Err(bad(cmd, format!("unknown hole type `{other}`"))),
     };
@@ -2117,6 +2217,7 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
             hole: kind,
             points: points.map(|x| x.0),
             thread,
+            thread_depth,
             to: to.map(FacePick),
             references,
         },
@@ -2138,7 +2239,7 @@ fn hole_reference_params(s: &Session, p: &Value, cmd: &str) -> Result<Vec<solidc
             .get("edge")
             .and_then(vec3)
             .ok_or_else(|| bad(cmd, format!("`references[{i}].edge` must be a point [x, y, z] on a straight edge of the face")))?;
-        let distance = expr(r, "distance").ok_or_else(|| bad(cmd, format!("`references[{i}].distance` must be a number or an expression")))?;
+        let distance = expr(r, "distance").ok_or_else(|| bad(cmd, format!("`references[{i}].distance` {}", expr_problem(r.get("distance")))))?;
         check_expr(s, &distance, Kind::Length, cmd, "references")?;
         out.push(solidcraft_doc::HoleReference { edge: Position(edge), distance });
     }
@@ -2309,7 +2410,7 @@ pub(super) fn sweep_options(s: &Session, p: &Value, cmd: &str) -> Result<(SweepO
     let scale = match p.get("scale") {
         None | Some(Value::Null) => None,
         Some(_) => {
-            let k = expr(p, "scale").ok_or_else(|| bad(cmd, "`scale` must be a number or an expression"))?;
+            let k = req_expr(cmd, p, "scale")?;
             let v = s.doc.eval(&k, Kind::Unitless).map_err(|e| bad(cmd, format!("scale: {e}")))?;
             let range = solidcraft_kernel::SweepControl::MIN_SCALE..=solidcraft_kernel::SweepControl::MAX_SCALE;
             if !(v.is_finite() && range.contains(&v)) {

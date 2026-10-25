@@ -156,6 +156,70 @@ fn auto_constrain_fully_constrains_a_rough_sketch() {
 }
 
 #[test]
+fn auto_constrain_dimensions_construction_curves_without_moving_them() {
+    for command in ["sketch.auto_constrain", "sketch.auto_constrain_from_datum", "sketch.finish_auto_constrain"] {
+        for (create, params, dimension) in [
+            ("sketch.circle.center", json!({"center": [20, 15], "radius": 5}), "diameter"),
+            ("sketch.line", json!({"points": [[10, 20], [30, 35]]}), "length"),
+            ("sketch.arc.center_point", json!({"center": [20, 15], "start": [25, 15], "end": [20, 20]}), "radius"),
+        ] {
+            let mut s = new_sketch();
+            let curves = run(&mut s, create, params)["curves"].clone();
+            run(&mut s, "sketch.construction", json!({"curves": curves, "value": true}));
+            let id = s.active_sketch.unwrap();
+            let before = sketch(&s);
+            let r = run(&mut s, command, json!({"datum": "origin"}));
+            assert_eq!(r["dof"], 0, "{command}, {create}: {r}");
+            let si = run(&mut s, "sketch.inspect", json!({"sketch": id}));
+            assert_eq!(si["fully_constrained"], true, "{si}");
+            assert!(si["constraints"].as_array().unwrap().iter().any(|c| c["type"] == dimension), "{si}");
+            let state = s.model.state();
+            let after = &state.sketch(id).unwrap().sketch;
+            assert_eq!(before.curves.len(), after.curves.len());
+            assert_eq!(before.points.len(), after.points.len());
+            for (a, b) in before.curves.iter().zip(&after.curves) {
+                assert_eq!(a.id, b.id);
+                assert!(b.construction);
+            }
+            for (i, _) in before.points.iter().enumerate() {
+                assert!(before.point(i).unwrap().dist(after.point(i).unwrap()) < 1e-6);
+            }
+            for i in 0..before.curves.len() {
+                if let Some(radius) = before.radius(i) {
+                    assert!((radius - after.radius(i).unwrap()).abs() < 1e-6);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn auto_constrain_construction_circle_respects_options_and_existing_constraints() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 15], "radius": 5, "construction": true}));
+    let r = run(&mut s, "sketch.auto_constrain", json!({"dimensions": false}));
+    assert_eq!(r["dof"], 3, "{r}");
+    assert!(r["added"].as_array().unwrap().is_empty());
+    run(&mut s, "sketch.auto_constrain", json!({}));
+    let constrained = sketch(&s);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(run(&mut s, "sketch.inspect", json!({}))["dof"], 3);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(sketch(&s), constrained);
+    let r = run(&mut s, "sketch.auto_constrain", json!({}));
+    assert!(r["added"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(sketch(&s), constrained);
+
+    let mut s = new_sketch();
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 15], "radius": 5, "construction": true}));
+    run(&mut s, "sketch.constraint.fix", json!({"entity": "c1"}));
+    let fixed = sketch(&s);
+    let r = run(&mut s, "sketch.auto_constrain", json!({}));
+    assert!(r["added"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(sketch(&s), fixed);
+}
+
+#[test]
 fn internal_freedom_queries_skip_redundancy_and_keep_constraint_acceptance() {
     use solidcraft_sketch::{ConstraintKind, Sketch, profiling::capture};
 
@@ -475,6 +539,49 @@ fn symmetry_slides_a_rectangle_whose_width_is_dimensioned() {
     let at = |r: String| sk.point(sk.resolve_point(&r).unwrap()).unwrap();
     let (l, r) = (at(format!("{}.start", sides[3])), at(format!("{}.start", sides[1])));
     assert!((r.x - l.x - 42.0).abs() < 1e-6 && (l.x + 21.0).abs() < 1e-6, "sides at ±21: {l:?} {r:?}");
+}
+
+#[test]
+fn symmetry_pairs_the_ends_of_fixed_lines_drawn_the_opposite_way() {
+    // #1796: the sides of a face outline run in opposite directions (up one side, down the
+    // other). Pairing start with start asked for a reflection no line gives, and centring a
+    // construction line between them was refused as "neither entity can move".
+    let mut s = new_sketch();
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [0, 20]], "ids": ["left"]}));
+    run(&mut s, "sketch.line", json!({"points": [[10, 20], [10, 0]], "ids": ["right"]}));
+    run(&mut s, "sketch.line", json!({"points": [[3, 2], [3, 18]], "construction": true, "ids": ["mid"]}));
+    run(&mut s, "sketch.constraint.fix", json!({"entities": ["left", "right"]}));
+    run(&mut s, "sketch.constraint.symmetry", json!({"a": "left", "b": "right", "line": "mid"}));
+    let sk = sketch(&s);
+    let at = |r: &str| sk.point(sk.resolve_point(r).unwrap()).unwrap();
+    for end in ["mid.start", "mid.end"] {
+        assert!((at(end).x - 5.0).abs() < 1e-7, "{end} at {:?}", at(end));
+    }
+    assert!((at("mid.end").y - at("mid.start").y - 16.0).abs() < 1e-7, "the line keeps its length");
+}
+
+#[test]
+fn symmetry_pairs_ends_by_their_mirror_images() {
+    // Free lines: each `b` end goes to the mirror image of the `a` end nearest it, so a line
+    // drawn either way round mirrors without flipping, and lines meeting at the axis (a V) or
+    // end to end along it keep their pairs.
+    for (a, b, axis, want) in [
+        ([[0.0, 0.0], [0.0, 20.0]], [[10.0, 21.0], [10.0, 1.0]], [[5.0, -5.0], [5.0, 30.0]], [[10.0, 20.0], [10.0, 0.0]]),
+        ([[0.0, 0.0], [4.0, 10.0]], [[10.0, 1.0], [6.0, 9.0]], [[5.0, -5.0], [5.0, 30.0]], [[10.0, 0.0], [6.0, 10.0]]),
+        ([[0.0, 0.0], [10.0, 0.0]], [[29.0, 1.0], [21.0, -1.0]], [[15.0, -5.0], [15.0, 5.0]], [[30.0, 0.0], [20.0, 0.0]]),
+    ] {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.line", json!({"points": a, "ids": ["a"]}));
+        run(&mut s, "sketch.line", json!({"points": b, "ids": ["b"]}));
+        run(&mut s, "sketch.line", json!({"points": axis, "construction": true, "ids": ["m"]}));
+        run(&mut s, "sketch.constraint.fix", json!({"entities": ["a", "m"]}));
+        run(&mut s, "sketch.constraint.symmetry", json!({"a": "a", "b": "b", "line": "m"}));
+        let sk = sketch(&s);
+        let at = |r: &str| sk.point(sk.resolve_point(r).unwrap()).unwrap();
+        for (end, [x, y]) in ["b.start", "b.end"].into_iter().zip(want) {
+            assert!(at(end).dist(Vec2::new(x, y)) < 1e-6, "{a:?} {b:?}: {end} at {:?}, want [{x}, {y}]", at(end));
+        }
+    }
 }
 
 #[test]

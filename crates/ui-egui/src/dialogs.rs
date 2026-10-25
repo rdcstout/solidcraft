@@ -405,6 +405,9 @@ pub struct HoleOpts {
     pub custom_thread: Option<crate::dialogs_thread::HoleThreadDraft>,
     /// The Single hole's reference edge distances (`hole_refs`, #37).
     pub refs: Box<crate::hole_refs::Refs>,
+    /// Use the full useful cylindrical wall, independently of the drill extents.
+    pub thread_full_depth: bool,
+    pub thread_depth: String,
 }
 
 impl Default for HoleOpts {
@@ -418,6 +421,8 @@ impl Default for HoleOpts {
             thread: "M5".into(),
             custom_thread: None,
             refs: Default::default(),
+            thread_full_depth: true,
+            thread_depth: "10 mm".into(),
         }
     }
 }
@@ -452,6 +457,8 @@ pub struct Dialog {
     pub(crate) picked_edges: Vec<Sel>,
     /// Whether `inputs[0]` currently includes the tangent chains of `picked_edges`.
     pub(crate) chain_applied: bool,
+    /// A pattern's objects of the Object Type not shown now, restored when it is chosen again.
+    pub(crate) other_objects: Vec<Sel>,
     /// Shell feedback is derived from the picks, never saved as additional face references.
     shell_chain: std::cell::RefCell<Option<ShellChain>>,
     /// An extrude Press Pull opened with nothing selected: its first pick may be a curved face or
@@ -610,6 +617,11 @@ fn fits(a: Accept, s: &Sel) -> bool {
 }
 
 impl Dialog {
+    /// The command this dialog runs, whose icon and label its header shows.
+    pub(crate) fn command(&self) -> Option<&'static str> {
+        dense::command(&self.kind)
+    }
+
     /// Show why OK (or starting the sketch) was refused, for as long as the inputs stay as they are.
     fn refuse(&mut self, app: &SolveApp, error: String) {
         self.refused = Some(Refused::now(app, self));
@@ -635,6 +647,7 @@ impl Dialog {
             then_start: None,
             picked_edges: Vec::new(),
             chain_applied,
+            other_objects: Vec::new(),
             shell_chain: Default::default(),
             press_pull: false,
         }
@@ -1944,7 +1957,10 @@ fn object_type_row(d: &mut Dialog, ui: &mut egui::Ui) {
     if ty != cur {
         inp.accept = if ty == 1 { selection::FEATURES } else { BODIES };
         inp.label = objects_label(inp.accept);
-        inp.items.clear();
+        // The pre-selection moved into this input when the dialog opened, so switching back
+        // restores what the other type held instead of losing it.
+        let back = std::mem::take(&mut d.other_objects);
+        d.other_objects = std::mem::replace(&mut inp.items, back);
         d.active = 0;
     }
 }
@@ -2403,6 +2419,15 @@ fn auto_operation(app: &SolveApp, d: &mut Dialog) {
         return;
     }
     let Some(params) = dialog_commands(app, d).ok().and_then(|c| c.into_iter().next()).map(|(_, p)| p) else { return };
+    // A new start (From Object, a start offset) puts the extrude somewhere else: the latch was
+    // decided for the old one (#467).
+    let start = json!([params.get("from"), params.get("start_offset")]);
+    if let Kind::Extrude { smart, .. } = &mut d.kind
+        && smart.start != start
+    {
+        smart.start = start;
+        smart.latch = None;
+    }
     // To an object, the extrude goes to it on whichever side it is: that is the side (#1633).
     if params.get("to").is_some()
         && let Some(reach) = solidcraft_engine::extrude_reach(&app.session, &params)
@@ -2438,9 +2463,6 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         app.viewport.dialog_rect = None;
     }
     let Some(mut d) = app.dialog.take() else {
-        if app.tree.redefine.is_none() && app.params.is_none() {
-            crate::frame::reset_dock_offset(ctx);
-        }
         return;
     };
     // Edit Text lasts as long as its text: other design changes leave it open.
@@ -2492,9 +2514,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         app.dialog = Some(d);
         return;
     }
-    // Dragged by its title band, the dialog keeps that offset from its docked place while it
-    // is open (#1335), kept inside the viewport.
-    let moved = crate::frame::dock_offset(ctx, title(&d.kind));
+    // Command dialogs share the last dragged offset on this side until the application
+    // exits, kept inside the viewport.
+    let drag_key = side.dialog_offset_key();
+    let moved = crate::frame::dock_offset(ctx, drag_key);
     let docked = egui::pos2(side.anchor_x(vp), top);
     let drag_bounds = crate::shell::tool_drag_rect(app, vp);
     let anchor = crate::frame::offset_anchor(docked, moved, drag_bounds, side);
@@ -2576,14 +2599,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             let icon = spec.as_ref().map_or("", |s| s.icon);
             let label = spec.as_ref().map_or(heading.as_str(), |s| tr(s.label));
             let label = if d.editing.is_some() { heading.as_str() } else { label };
-            let heading = crate::ui_kit::FeatureOptions {
-                icon,
-                title: label,
-                drag_key: title(&d.kind),
-                moved,
-                docked,
-                apply_label: repeatable.then_some("Apply"),
-            };
+            let heading = crate::ui_kit::FeatureOptions { icon, title: label, drag_key, moved, docked, apply_label: repeatable.then_some("Apply") };
             let applying = app.applying.is_some();
             let mut collapsed = d.collapsed;
             let manager = matches!(
@@ -2765,8 +2781,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if keep && !cancel {
         // The canvas follows Edit Text's fields.
-        if let Kind::Text(k) = &mut d.kind {
-            crate::sketch_text::preview(app, k);
+        if let Kind::Text(k) = &mut d.kind
+            && let Some(result) = crate::sketch_text::preview(app, k)
+        {
+            d.error = result.err();
         }
         app.dialog = Some(d);
     } else if let Some((_, marker)) = d.editing {
@@ -3933,7 +3951,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 } else if !opts.all {
                     params["depth"] = json!(depth);
                 }
-                if ty == "drilled" {
+                if ty == "drilled" || (opts.angled && !opts.all) {
                     params["tip_angle"] = json!(opts.tip_angle);
                 }
                 if opts.tapped {
@@ -3943,6 +3961,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     solidcraft_engine::doc::parse_tapped_thread(&opts.thread)
                         .ok_or("select a valid metric or catalogued UNC/UNF, G or Rp thread size")?;
                     params["thread"] = json!(opts.thread.trim());
+                    if !opts.thread_full_depth {
+                        params["thread_depth"] = json!(opts.thread_depth.trim());
+                    }
                 }
                 match *kind {
                     1 => {
@@ -4157,9 +4178,17 @@ pub fn axis_of(app: &SolveApp, sel: &Sel) -> Option<(Vec3, Vec3)> {
             let st = app.session.world_state();
             let sid = curves_sketch(app, std::slice::from_ref(id), None)?;
             let ss = st.sketch(sid)?;
-            let c = ss.sketch.curves.get(ss.sketch.curve_index(id)?)?;
-            let solidcraft_engine::sketch::CurveKind::Line { a, b } = c.kind else { return None };
-            let (pa, pb) = (ss.plane.to_world(ss.sketch.point(a)?), ss.plane.to_world(ss.sketch.point(b)?));
+            let (pa, pb) = if let Some(i) = ss.sketch.curve_index(id) {
+                let c = ss.sketch.curves.get(i)?;
+                let solidcraft_engine::sketch::CurveKind::Line { a, b } = c.kind else { return None };
+                (ss.plane.to_world(ss.sketch.point(a)?), ss.plane.to_world(ss.sketch.point(b)?))
+            } else {
+                let w = ss.sketch.wires.get(ss.sketch.wire_index(id)?)?;
+                if w.fit.len() != 2 {
+                    return None;
+                }
+                (*w.pts.first()?, *w.pts.last()?)
+            };
             Some((pa, (pb - pa).normalized()?))
         }
         // A straight model edge, along it.
@@ -4694,7 +4723,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.extra.insert("pull".into(), pt3(pull.0));
             d
         }
-        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, to, references } => {
+        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, thread_depth, to, references } => {
             let mut d = start("solid.hole")?;
             let mut k = hole_defaults();
             if let Kind::Hole { diameter: dia, depth: dep, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &mut k {
@@ -4706,19 +4735,31 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                     opts.tapped = true;
                     opts.thread = th.clone();
                 }
+                opts.thread_full_depth = thread_depth.is_none();
+                if let Some(depth) = thread_depth {
+                    opts.thread_depth = depth.to_string();
+                }
                 if let Some(dd) = depth {
                     *dep = dd.to_string();
                 }
                 match hole {
-                    HoleKind::Counterbore { cb_diameter: a, cb_depth: b } => {
+                    HoleKind::Counterbore { cb_diameter: a, cb_depth: b, tip_angle } => {
                         *kind = 1;
                         *cb_diameter = a.to_string();
                         *cb_depth = b.to_string();
+                        if let Some(angle) = tip_angle {
+                            opts.angled = true;
+                            opts.tip_angle = angle.to_string();
+                        }
                     }
-                    HoleKind::Countersink { cs_diameter: a, cs_angle: b } => {
+                    HoleKind::Countersink { cs_diameter: a, cs_angle: b, tip_angle } => {
                         *kind = 2;
                         *cs_diameter = a.to_string();
                         *cs_angle = b.to_string();
+                        if let Some(angle) = tip_angle {
+                            opts.angled = true;
+                            opts.tip_angle = angle.to_string();
+                        }
                     }
                     HoleKind::Drilled { tip_angle } => {
                         opts.tip_angle = tip_angle.to_string();
@@ -5323,6 +5364,34 @@ mod refused_ok_tests {
 
     fn set_depth(h: &mut Harness, depth: &str) {
         steps(h, &[json!({"click": {"handle": "dialog:Depth"}}), json!({"key": "A", "cmd": true}), json!({"text": depth})]);
+    }
+
+    #[test]
+    fn recessed_drill_point_controls_and_payload_follow_the_bottom_choice() {
+        for recessed in [1, 2] {
+            let mut h = hole_dialog();
+            if let Kind::Hole { kind, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                *kind = recessed;
+                opts.angled = true;
+                opts.tip_angle = "118 deg".into();
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Drill Point").is_some());
+            assert!(crate::scenario::rect_of("dialog:widget:Tip Angle").is_some());
+            let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+            assert_eq!(commands[0].1["tip_angle"], "118 deg");
+            if let Kind::Hole { opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                opts.angled = false;
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Tip Angle").is_none());
+            assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1.get("tip_angle").is_none());
+            if let Kind::Hole { opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                opts.all = true;
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Drill Point").is_none());
+        }
     }
 
     /// What the dialog shows in red once the live preview has finished: its own error, else the

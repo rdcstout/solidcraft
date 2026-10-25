@@ -17,6 +17,7 @@ pub mod browser;
 pub mod browser_canvas;
 pub mod browser_prompts;
 pub mod canvas;
+pub mod cli_link;
 #[cfg(test)]
 mod colour_tokens_tests;
 #[cfg(test)]
@@ -251,6 +252,7 @@ mod thin_extrude_tests;
 pub mod timeline;
 pub mod timeline_left;
 pub mod titlebar;
+pub mod tool_cursor;
 pub mod tool_modifiers;
 pub mod toolbar;
 pub mod toolbar_custom;
@@ -307,6 +309,9 @@ pub struct UiState {
     pub up_axis: solidcraft_engine::render::UpAxis,
     /// The agent cursor: shown, speed, follow camera (#35).
     pub agent_cursor: agent_cursor::Settings,
+    /// The running tool's icon rides beside the pointer in the viewport (View settings; off by
+    /// default).
+    pub tool_cursor: bool,
 }
 
 impl Default for UiState {
@@ -328,6 +333,7 @@ impl Default for UiState {
             ground_shadow: true,
             up_axis: Default::default(),
             agent_cursor: Default::default(),
+            tool_cursor: false,
         }
     }
 }
@@ -539,6 +545,15 @@ pub struct SolveApp {
     applied_system_fonts: bool,
 }
 
+impl Drop for SolveApp {
+    /// The Home pictures it started are drawn before it goes: one still on the GPU as the
+    /// process exits can crash the graphics driver.
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        home::finish_pictures(&mut self.home, std::time::Duration::from_secs(10));
+    }
+}
+
 impl SolveApp {
     pub fn new(mut session: Session, services: Services) -> Self {
         #[cfg(test)]
@@ -721,6 +736,7 @@ impl SolveApp {
             "recent": self.home.recent,
             "recent_opened_at": self.home.opened_at,
             "document_library": self.library.prefs(),
+            "recent_forgotten": self.home.forgotten,
             "shortcut_box": self.sbox.prefs(),
             "shortcuts": self.keymap.prefs(),
             "toolbar": self.toolbar_custom.prefs(),
@@ -777,6 +793,7 @@ impl SolveApp {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).take(home::MAX_RECENT).map(str::to_string).collect())
             .unwrap_or_default();
+        self.home.forgotten = keys("recent_forgotten");
         if let Some(s) = v.get("shortcut_box") {
             self.sbox.load(s);
         }
@@ -1149,7 +1166,9 @@ impl SolveApp {
             self.last_command = Some((spec.id.to_string(), spec.label.to_string()));
         }
         if let Some(mut t) = tools::Tool::for_command(id) {
-            if let Some(params) = tools::constraint_preselection(id, &self.session.selection) {
+            let state = self.session.world_state();
+            let sketch = self.session.active_sketch.and_then(|s| state.sketch(s)).map(|ss| &ss.sketch);
+            if let Some(params) = tools::constraint_preselection(id, &self.session.selection, sketch) {
                 if self.run(id, params).is_ok() {
                     let _ = self.session.execute("select.clear", &json!({}));
                     self.set_status("Constraint applied", false);
