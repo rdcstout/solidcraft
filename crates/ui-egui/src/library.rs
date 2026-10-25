@@ -142,6 +142,10 @@ impl LibraryState {
 
     fn set_highlight(&mut self, path: &Path, color: Option<Highlight>) {
         if let Some(color) = color {
+            if path.to_str().is_none() {
+                self.error = Some("This filename is not valid UTF-8.".into());
+                return;
+            }
             if self.highlights.contains_key(path) || self.highlights.len() < MAX_HIGHLIGHTS {
                 self.highlights.insert(path.to_path_buf(), color);
             } else {
@@ -1036,6 +1040,15 @@ mod tests {
         assert_eq!(restored.highlights.get(Path::new("/valid")), Some(&Highlight::Purple));
         restored.load(Some(&json!({"root":null})));
         assert!(restored.highlights.is_empty(), "old settings remain compatible");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/CAD/invalid\xff.solidcraft"));
+            restored.set_highlight(invalid, Some(Highlight::Red));
+            assert!(restored.error.is_some());
+            assert!(restored.highlights.is_empty());
+            assert_eq!(restored.prefs()["highlights"], json!({}), "invalid filename must not break preference serialization");
+        }
     }
 
     #[test]
