@@ -7,11 +7,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod agent_setup;
 pub mod batch_params;
 pub mod capture;
 pub mod cmd;
 pub mod control_auth;
 pub mod control_pending;
+pub mod cosmetic_threads;
 pub mod crash;
 pub mod frames;
 pub mod fuzz;
@@ -112,9 +114,12 @@ pub enum Sel {
     Feature {
         id: u64,
     },
-    /// A sketch curve or point (by id) of the active sketch.
+    /// A sketch curve or point (by id) of the active sketch. A curve picked into a dialog also
+    /// names its `sketch`: curve ids repeat from one sketch to the next (#3726).
     SketchCurve {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sketch: Option<u64>,
     },
     SketchPoint {
         id: String,
@@ -322,6 +327,8 @@ pub struct Session {
     pub section: Option<(Vec3, Vec3)>,
     /// Whether the section's cut faces are hatched (`inspect.section`'s `hatch`; on by default).
     pub section_hatch: bool,
+    /// Component identification colours are enabled when present; view state only.
+    pub colored_components: Option<()>,
     /// Surface analysis shading the model (zebra, draft, curvature map).
     pub analysis: Option<SurfaceAnalysis>,
     /// The seams `inspect.continuity` last measured, for the viewport to shade. View state: not
@@ -486,6 +493,7 @@ impl Session {
             sketch_clipboard: None,
             section: None,
             section_hatch: true,
+            colored_components: None,
             analysis: None,
             continuity: Vec::new(),
             checkpoints: Vec::new(),
@@ -1147,6 +1155,7 @@ impl Session {
             sketch_clipboard: self.sketch_clipboard.clone(),
             section: None,
             section_hatch: true,
+            colored_components: None,
             analysis: None,
             continuity: Vec::new(),
             checkpoints: Vec::new(),
@@ -1432,6 +1441,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         units,
         metadata,
         params,
+        text_params,
         features: _,
         marker,
         next_id,
@@ -1457,6 +1467,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         browser_order,
         named_views,
         visibility,
+        next_component_color_index,
     } = a;
     *render == b.render
         && *format == b.format
@@ -1465,6 +1476,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *units == b.units
         && *metadata == b.metadata
         && *params == b.params
+        && *text_params == b.text_params
         && *marker == b.marker
         && *next_id == b.next_id
         && *reserved_body_names == b.reserved_body_names
@@ -1489,4 +1501,5 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *browser_order == b.browser_order
         && *named_views == b.named_views
         && *visibility == b.visibility
+        && *next_component_color_index == b.next_component_color_index
 }

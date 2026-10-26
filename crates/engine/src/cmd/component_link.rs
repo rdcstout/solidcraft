@@ -113,7 +113,8 @@ fn stored(design: Option<&str>, file: &Path) -> String {
 fn resolve(design: Option<&str>, link: &str) -> PathBuf {
     let p = Path::new(link);
     match base_dir(design) {
-        Some(d) if p.is_relative() => d.join(p),
+        // Browser storage keys do not let the OS resolve `..` for us.
+        Some(d) if p.is_relative() => absolute(&d.join(p)),
         _ => p.to_path_buf(),
     }
 }
@@ -233,13 +234,16 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let links: Vec<(u64, DesignLink)> = s.doc.links.iter().filter(|(c, _)| only.is_none_or(|o| o == **c)).map(|(c, l)| (*c, l.clone())).collect();
     let (mut updated, mut unchanged, mut warnings) = (Vec::new(), Vec::new(), Vec::new());
-    for (comp, link) in links {
+    let count = links.len();
+    for (index, (comp, link)) in links.into_iter().enumerate() {
         let cname = s.doc.components.iter().find(|c| c.id == comp).map(|c| c.name.clone());
         let Some(cname) = cname else {
             // The component was deleted: the link goes with it.
             s.doc_mut().links.remove(&comp);
             continue;
         };
+        // A window running this off its thread names the design being read again (#5329).
+        solidcraft_doc::progress::item(Some((&cname, index, count)));
         let Some(FeatureKind::Import { step: old, .. }) = s.doc.feature(link.feature).filter(|f| f.component == comp).map(|f| &f.kind) else {
             return Err(bad(
                 cmd,
@@ -279,6 +283,7 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
         }
         if changed { updated.push(cname) } else { unchanged.push(cname) }
     }
+    solidcraft_doc::progress::item(None);
     s.refresh();
     if let Some(e) = s.doc.links.values().find_map(|l| s.model.result(l.feature).and_then(|r| r.error.clone())) {
         return Err(EngineError::Other(e));
@@ -381,7 +386,8 @@ fn list_links(s: &mut Session, _p: &Value) -> Result<Value> {
         .map(|(c, l)| {
             let file = resolve(s.path.as_deref(), &l.path);
             let name = s.doc.components.iter().find(|x| x.id == *c).map(|x| x.name.clone());
-            json!({"component": c, "name": name, "path": l.path, "file": file.display().to_string(), "found": file.is_file()})
+            let file = file.to_string_lossy();
+            json!({"component": c, "name": name, "path": l.path, "file": file, "found": solidcraft_io::vfs::is_file(&file)})
         })
         .collect();
     Ok(json!({"links": links}))
@@ -399,7 +405,7 @@ mod tests {
         let design = root.join("assembly").join("case.solidcraft");
         let design = design.to_string_lossy().into_owned();
         assert_eq!(stored(Some(&design), &part), "../parts/plate.solidcraft");
-        assert_eq!(absolute(&resolve(Some(&design), "../parts/plate.solidcraft")), part);
+        assert_eq!(resolve(Some(&design), "../parts/plate.solidcraft"), part);
         // A design path given relative to the working folder works the same.
         assert_eq!(stored(Some("case.solidcraft"), &absolute(Path::new("parts/plate.solidcraft"))), "parts/plate.solidcraft");
         // Before the design has a file the path is kept whole; saving it makes it relative.
