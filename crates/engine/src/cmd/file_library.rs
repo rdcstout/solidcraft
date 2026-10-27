@@ -76,7 +76,7 @@ fn transfer(s: &mut Session, p: &Value, moving: bool) -> Result<Value> {
     // Validate before a filesystem mutation, and keep external component links pointing
     // to the same originals when moving a saved assembly to another folder.
     let mut doc = solidcraft_io::read_design(&original)?;
-    let links = super::component_link::rebased(&doc, Some(path), destination);
+    let links = super::design_link::rebased(&doc, Some(path), destination);
     let contents = if links != doc.links {
         doc.links = links;
         if destination.to_lowercase().ends_with(".json") { solidcraft_io::write_design(&doc) } else { solidcraft_io::write_design_container(&doc)? }
