@@ -42,7 +42,9 @@
   diagonal view; Shift does not request snapping when the preset already requires it to orbit.
 
   Enable **Preferences → Navigation → Free orbit** to rotate the mouse and 3D mouse continuously
-  through both poles, preserving roll without axis snapping. It defaults to off for every mouse
+  through both poles, preserving roll. During an orbit drag, Shift snaps the view direction and
+  the picture rotation to the nearest quarter turn; releasing Shift resumes the unsnapped rotation.
+  Free orbit defaults to off for every mouse
   preset. With SolidWorks navigation, right-click a planar face and choose **Normal to Selection**
   to use Look At (also Ctrl+8); repeat to flip the side, preserving scale and projection.
 
@@ -126,6 +128,12 @@ camera, selection and design; Cancel and Restore Defaults work like other prefer
 General › **Show text under ribbon icons** is a separate, saved option for either
 layout. Turn it off for shorter icon-only command buttons; tooltips, section names
 and command menus remain available.
+
+Interface › Layout › **Show origin and bodies at the top** (off by default) puts the active
+component's Bodies folder and the Origin (planes, axes and point) at the top of the History when
+it sits on the left or under the browser and is wide enough for names. They are the browser's own
+rows: the same eyes, folds and right-click menus, so one list is enough for single-part work. The
+History at the bottom is unchanged.
 
 ### Colour themes
 

@@ -1047,6 +1047,12 @@ const CACHE_ENTRIES: usize = 4096;
 const CACHE_BYTES: usize = 64 << 20;
 
 impl EvalCache {
+    /// A cache that keeps `bytes` of results (always at least the last one): a small budget
+    /// stands in for a design whose states are large.
+    pub fn with_budget(bytes: usize) -> Self {
+        EvalCache { budget: bytes, ..EvalCache::default() }
+    }
+
     fn get(&mut self, key: u64) -> Option<CachedEval> {
         let r = self.map.get(&key).cloned();
         if r.is_some() {
@@ -7487,14 +7493,37 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 return replay(doc, vals, f, st, features, &mats, warning);
             }
             // Bodies: each copy is a new body named after its source.
+            let here = doc.component_transform(f.component);
             let mut output = 0;
             for n in bodies {
                 let mb = st.body(n).cloned().ok_or_else(|| DocError::Unknown(format!("body `{n}`")))?;
+                // A body of another component is held in that component's frame, the pattern's
+                // transforms in this feature's: each copy is moved as the pattern moves it in the
+                // world and kept beside its source, in its component (#4763). Taken as they were,
+                // the copies landed where the source sits before its component is placed.
+                let owner = (mb.component != f.component).then(|| {
+                    let frame = doc.component_transform(mb.component);
+                    let singular = || DocError::Invalid(format!("the component holding `{n}` has a singular placement"));
+                    Ok::<_, DocError>((frame, crate::mat_inverse(&frame).ok_or_else(singular)?, crate::mat_inverse(&here).ok_or_else(singular)?))
+                });
+                let owner = owner.transpose()?;
                 for (k, m) in mats.iter().enumerate() {
-                    let copy = moved_copy(&mb, kernel::transform_matrix(&mb.body, *m)?, k + 1);
+                    let local = match &owner {
+                        Some((frame, frame_inv, here_inv)) => {
+                            crate::mat_mul(&crate::mat_mul(frame_inv, &here), &crate::mat_mul(&crate::mat_mul(m, here_inv), frame))
+                        }
+                        None => *m,
+                    };
+                    let copy = moved_copy(&mb, kernel::transform_matrix(&mb.body, local)?, k + 1);
                     let name = pattern_copy_name(st, f, output, &mb.name);
-                    copy_sheet(st, &mb.name, &name, m);
-                    st.bodies.push(ModelBody::traced_new(name, copy, f.id));
+                    copy_sheet(st, &mb.name, &name, &local);
+                    let mut body = ModelBody::traced_new(name, copy, f.id);
+                    if owner.is_some() {
+                        // Kept in that component as a moved body is (and through later features).
+                        body.component = mb.component;
+                        body.transferred = true;
+                    }
+                    st.bodies.push(body);
                     output += 1;
                 }
             }
@@ -8342,12 +8371,13 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
     // places hundreds of parts, each a B-rep transform.
     let mut jobs = Vec::new();
     let owners = doc.model_body_components(st);
+    let names = crate::WorldNames::new(doc, st);
     let bodies_of = |comp: u64| st.bodies.iter().zip(&owners).filter(move |(_, owner)| **owner == comp).map(|(b, _)| b);
     for (comp, path, m) in &placements {
         for b in bodies_of(*comp) {
             let bm = body_matrix(b, m);
             if !crate::is_identity(&bm) {
-                jobs.push((b, bm, doc.world_body_name(st, &b.name, *comp, path)));
+                jobs.push((b, bm, names.name(&b.name, *comp, path)));
             }
         }
     }
@@ -8366,14 +8396,14 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
             // A changed placement keeps a distinct mesh, at that placement's coordinates.
             let mut placed = if crate::is_identity(&bm) {
                 let mut placed = b.clone();
-                placed.name = doc.world_body_name(st, &b.name, comp, &path);
+                placed.name = names.name(&b.name, comp, &path);
                 placed
             } else {
                 // The same order as the jobs: this body's, made above (again here if it failed).
                 let placed = match moved.next() {
                     Some((Some(placed), _)) => placed,
                     Some((None, (_, _, name))) => placed_before.placed(b, &bm, name.clone()),
-                    None => placed_before.placed(b, &bm, doc.world_body_name(st, &b.name, comp, &path)),
+                    None => placed_before.placed(b, &bm, names.name(&b.name, comp, &path)),
                 };
                 placed_now.by_source.insert(placed_key(b, &bm), (b.clone(), placed.clone()));
                 placed
@@ -8428,7 +8458,7 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
             .filter(|t| st.body(&t.body).map(|body| doc.model_body_component(body)).unwrap_or_else(|| comp_of_feature(t.feature)) == comp)
         {
             let mut t2 = t.clone();
-            t2.body = doc.world_body_name(st, &t.body, comp, &path);
+            t2.body = names.name(&t.body, comp, &path);
             let frame = st.body(&t.body).and_then(|body| doc.model_body_offset(body)).map(|offset| crate::mat_mul(&m, offset)).unwrap_or(m);
             t2.axis_point = crate::apply_point(&frame, t.axis_point);
             t2.axis = crate::apply_vector(&frame, *t.axis).unit().unwrap_or(t.axis);
