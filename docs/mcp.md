@@ -77,11 +77,19 @@ design is left as it was. Calls bridged to the app are not checked yet.
 
 Tool calls read, write and delete files only inside the server's folders:
 
-- the folder of the open design (the `--in` design, or whatever the agent last opened or saved),
-  but only when it lies strictly inside your home folder (or the temporary folder) and not in a
-  hidden folder. Home itself, a folder above it (`/`, `/home`, `/Users`, a drive's root),
-  hidden folders such as `~/.config` and folders elsewhere don't count. Hidden files and folders
-  inside the design's folder (`.env`, `.git`) are out of reach too;
+- the folder of the open design (the `--in` design, the design open in the app, or whatever
+  the agent last opened or saved), but only when it lies strictly inside your home folder (or
+  the temporary folder) and not in a hidden folder. Home itself, a folder above it (`/`,
+  `/home`, `/Users`, a drive's root), hidden folders such as `~/.config` and folders elsewhere
+  don't count. Hidden files and folders inside the design's folder (`.env`, `.git`) are out of
+  reach too;
+- on the same terms, every folder the agent opened or saved a design file in during this
+  server's run (`open`, `save`, or `doc.open`, `file.save` and `file.save_as` through `execute`
+  or `batch`, with the path given in full) and, headless, every folder a design was open in,
+  until the server stops (the 16 most recent). So after a new design, an opened STEP file or a
+  save-as elsewhere, the agent can still save beside the design it worked on. Such a call
+  succeeded only because its folder was already one of the agent's, so no folder joins just
+  because the agent names it;
 - SolidCraft's own recovery folder, so `doc.recovery_list`, `doc.recover` and
   `doc.recovery_discard` work out of the box (discarding deletes only real recovery entries);
 - the server's own scratch folder (a new private `solidcraft-mcp-*` folder in the temporary
@@ -116,7 +124,15 @@ solidcraft-cli mcp --allow-path ~/designs --allow-path ~/exports
 solidcraft-cli mcp --allow-any-path   # no limit (the behaviour before this option existed)
 ```
 
-Bridged, the server sends its folders with every request (`allow_paths`, see
+When a `save` (or any other call) is refused with `… outside the folders this agent may use …`,
+add the folder to the server's `args` in your MCP client's configuration (the `mcpServers`
+entries below, or what `solidcraft-cli mcp setup` wrote), for example
+`"args": ["mcp", "--allow-path", "/Users/NAME/Documents/Designs"]`, and restart the client.
+An agent should ask you to do that rather than save through the app's control port, which
+knows nothing of these folders.
+
+Bridged, the server sends its folders with every request (`allow_paths`, and the folders the
+agent opened or saved a design in as `design_folders`, see
 [control-protocol.md](control-protocol.md)) and the app adds its own recovery folder and the
 folder of the design open in it, under the same rules, so give absolute paths: a relative one
 resolves against the app's working folder, not the server's. The app's own
@@ -348,7 +364,7 @@ the batch added to the undo history.)
 
 ## Camera and close-up recipe
 
-The `camera` of `screenshot` (the object `view.apply`, `view.save` and `solidcraft-cli snapshot --camera` take too) is an orbit camera, `{target, yaw, pitch, distance, fov?}`, in millimetres and **radians**. Unlike the `angle` of `solid.move`, a bare number is not degrees here. The eye is at `target + distance * (-sin(yaw) * cos(pitch), -cos(yaw) * cos(pitch), sin(pitch))`, looking at `target` with Z up on the screen. So `yaw: 0, pitch: 0` is the front view: the eye at -Y, looking along +Y, with +X to the right. A yaw of π/2 looks from -X, π from +Y and -π/2 from +X. The pitch is the elevation angle up from the XY plane, and π/2 looks straight down with +X to the right and +Y up. `fov` is the vertical field of view in radians. `0`, or no `fov`, is an orthographic view whose visible half-height is 0.4 × `distance`; with a perspective `fov` the half-height at the target is `distance * tan(fov / 2)`. `inspect.section` removes what lies on the side its normal points to: it keeps the points `p` with `n · p < d`, where `d = n · origin` (`flip: true` keeps the other side). To look into the cut, put the eye on the removed side.
+The `camera` of `screenshot` (the object `view.apply`, `view.save` and `solidcraft-cli snapshot --camera` take too) is an orbit camera, `{target, yaw, pitch, distance, fov?}`, in millimetres and **radians**. Unlike the `angle` of `solid.move`, a bare number is not degrees here. The eye is at `target + distance * (-sin(yaw) * cos(pitch), -cos(yaw) * cos(pitch), sin(pitch))`, looking at `target` with Z up on the screen. So `yaw: 0, pitch: 0` is the front view: the eye at -Y, looking along +Y, with +X to the right. A yaw of π/2 looks from -X, π from +Y and -π/2 from +X. The pitch is the elevation angle up from the XY plane, and π/2 looks straight down with +X to the right and +Y up; `view.apply` refuses a pitch past ±π/2. A positive `roll` turns the picture clockwise. The app's View angles readout (`view.angle_readout`) shows the same yaw, pitch and roll in degrees. `fov` is the vertical field of view in radians. `0`, or no `fov`, is an orthographic view whose visible half-height is 0.4 × `distance`; with a perspective `fov` the half-height at the target is `distance * tan(fov / 2)`. `inspect.section` removes what lies on the side its normal points to: it keeps the points `p` with `n · p < d`, where `d = n · origin` (`flip: true` keeps the other side). To look into the cut, put the eye on the removed side.
 
 To look closely at one part of a large model, such as a STEP assembly, work in a headless session. These steps change only the open design in memory:
 

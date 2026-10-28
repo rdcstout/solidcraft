@@ -432,7 +432,6 @@ pub(crate) struct CameraInput {
     pub secondary_down: bool,
     pub primary_down: bool,
     pub primary_pressed: bool,
-    pub delta: egui::Vec2,
     /// The pointer is over this view (not a window, menu or the axis view above it).
     pub inside: bool,
     /// The axis view or navigation cube's rectangle.
@@ -471,11 +470,16 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     let secondary_down = secondary_down && app.viewport.context_menu.is_none();
     // The axis view handles its own clicks; the model underneath must not see them.
     let axes = if caps.orbit { axis_rect(app, rect) } else { Rect::NOTHING };
+    // So is the View angles readout under it (#6032).
+    let readout = crate::view_angles::readout_rect(ui.ctx(), rect).filter(|_| caps.orbit && app.preferences.show_view_angles);
     // Floating windows and menus own input over the model, including wheel navigation. egui's
     // hit test also counts the model as under the pointer a few points past its own edge and
     // inside a window's or a list's edge (#678), so the pointer must be in the viewport too,
     // with no window or menu above it.
-    let inside = ui.is_enabled() && resp.contains_pointer() && ui.rect_contains_pointer(rect) && hover.is_some_and(|p| !axes.contains(p));
+    let inside = ui.is_enabled()
+        && resp.contains_pointer()
+        && ui.rect_contains_pointer(rect)
+        && hover.is_some_and(|p| !axes.contains(p) && !readout.is_some_and(|r| r.contains(p)));
     app.viewport.mouse = hover.filter(|_| inside);
     // Sketch snap suppression is set once in `viewport::show` from preferences.
     middle_double_click(app, ui, inside);
@@ -507,6 +511,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     let mut pan =
         if trackpad_pan { raw.pan + if trackpad_orbit { egui::Vec2::ZERO } else { raw.shift_pan } } else { egui::Vec2::ZERO } + raw.mouse_pan;
     pan.x *= crate::prefs::pan_sign_x(app);
+    pan.y *= crate::prefs::pan_sign_y(app);
     let scroll = if app.viewport.wheel_zoom_raw_until_idle || (trackpad_pan && app.viewport.trackpad_until_idle) {
         raw.zoom + if trackpad_pan { 0.0 } else { raw.point_zoom }
     } else {
@@ -602,9 +607,21 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     }
     // The fixed navigation mode (navigation bar), a held Space, or the preset's left-button binding.
     let primary_nav = if space_pan { Some(NavMode::Pan) } else { app.viewport.nav.or(app.viewport.primary_nav) };
+    // The right button also clicks (the context menu), so it navigates only once the press can no
+    // longer be a click: a Magic Mouse moves the pointer a fraction of a point as it is clicked (#5517).
+    // On that frame the drag catches up with the whole way from the press, so none of it is lost.
+    let (right_drag, travel) = ui.input(|i| {
+        let drag = secondary_down && !i.pointer.could_any_button_be_click();
+        (drag, i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(from, to)| to - from))
+    });
+    let delta = match travel {
+        Some(travel) if right_drag && !app.viewport.right_drag && !middle && travel.is_finite() => travel,
+        _ => delta,
+    };
+    app.viewport.right_drag = right_drag;
     let button = if middle {
         Some(crate::prefs::NavButton::Middle)
-    } else if secondary_down {
+    } else if right_drag {
         Some(crate::prefs::NavButton::Right)
     } else {
         None
@@ -711,7 +728,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         app.cam = Camera::default();
         app.fit_view();
     }
-    CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, delta, inside, axes, pinch, pan, primary_nav, mode }
+    CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, inside, axes, pinch, pan, primary_nav, mode }
 }
 
 /// The 3D mouse's motion this frame (#1336), on a page `rect` whose camera may do `caps`: the cap

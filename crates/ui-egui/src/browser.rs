@@ -841,29 +841,25 @@ pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
         let frame = container.frame(ui.ctx(), fill, crate::frame::Side::Left).inner_margin(CARD_INSET as i8);
         let inner_width = (bounds.width() - frame.total_margin().sum().x).max(0.0);
         let inner_height = (bounds.height() - frame.total_margin().sum().y).max(0.0);
-        let card = Container::new(ui.ctx(), Surface::Panel)
-            .area(egui::Id::new("sc_browser_card"))
-            .fixed_pos(bounds.min)
-            .order(egui::Order::Middle)
-            .show(ui.ctx(), |ui| {
-                let limits = Rect::from_min_max(available.min, pos2(available.right(), bounds.bottom()));
-                let response = container.show_frame(ui, frame, limits, |ui| {
-                    ui.set_width(inner_width);
-                    ui.set_max_height(inner_height);
-                    if stacked {
-                        ui.set_min_height(inner_height);
-                        ui.set_clip_rect(ui.clip_rect().intersect(Rect::from_min_size(ui.max_rect().min, vec2(inner_width, inner_height))));
-                    }
-                    if collapsed {
-                        browser_collapsed_rail(app, ui);
-                    } else {
-                        browser_contents(app, ui, &mut acts, true);
-                    }
-                });
-                if !collapsed {
-                    resize_column(app, ui, response.response.rect, width, "left-browser-rail");
+        let card = Container::new(ui.ctx(), Surface::Panel).area(egui::Id::new("sc_browser_card")).fixed_pos(bounds.min).show(ui.ctx(), |ui| {
+            let limits = Rect::from_min_max(available.min, pos2(available.right(), bounds.bottom()));
+            let response = container.show_frame(ui, frame, limits, |ui| {
+                ui.set_width(inner_width);
+                ui.set_max_height(inner_height);
+                if stacked {
+                    ui.set_min_height(inner_height);
+                    ui.set_clip_rect(ui.clip_rect().intersect(Rect::from_min_size(ui.max_rect().min, vec2(inner_width, inner_height))));
+                }
+                if collapsed {
+                    browser_collapsed_rail(app, ui);
+                } else {
+                    browser_contents(app, ui, &mut acts, true);
                 }
             });
+            if !collapsed {
+                resize_column(app, ui, response.response.rect, width, "left-browser-rail");
+            }
+        });
         let rect = card.response.rect;
         app.shell.browser = Some(rect);
         crate::scenario::publish_rect("browser:card", rect);
@@ -882,6 +878,7 @@ fn render_card(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
     if narrow && !app.shell.render_browser_open {
         app.shell.browser = None;
         crate::shell::register_panel(app, "render:browser", None, None);
+        crate::shell::register_panel(app, "render:appearances", None, None);
         crate::render_ui::dock_chip(app, ui, "render:browser:show", "ui.browser_title", "view.render_browser", json!({"open":true}));
         return;
     }
@@ -898,9 +895,11 @@ fn render_card(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
             id: "render:browser",
             title: &title,
             icon: "list",
-            bounds,
+            bounds: crate::ui_kit::Panel::stack_first_bounds(bounds),
             fill_height: true,
             compact: crate::render_ui::compact(app, bounds.width()),
+            enabled: true,
+            header_actions: None,
         },
         &mut side,
         &mut width,
@@ -944,6 +943,9 @@ fn render_card(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
     );
     if let Some(rect) = rect {
         crate::scenario::publish_rect("browser:card", rect);
+        crate::render_workspace::appearances_card(app, ui, crate::ui_kit::Panel::stack_next_bounds(bounds, rect));
+    } else {
+        crate::shell::register_panel(app, "render:appearances", None, None);
     }
 }
 
@@ -2032,9 +2034,9 @@ impl Entry {
             thing: Thing::Sketch(f.id),
             patterns: crate::sketch_pattern_tree::has_patterns(app, f.id).then(|| format!("s:{}/patterns", f.id)),
             label: if lost {
-                format!("{}  (attachment lost)", f.name)
+                crate::i18n::format("browser.sketch_attachment_lost", &[("name", &crate::i18n::tr_name(&f.name))])
             } else if active {
-                format!("{}  (editing)", f.name)
+                crate::i18n::format("browser.sketch_editing", &[("name", &crate::i18n::tr_name(&f.name))])
             } else {
                 f.name.clone()
             },
@@ -2427,7 +2429,8 @@ fn entry_row(
     let pattern_key = e.patterns.as_deref();
     let patterns_open = pattern_key.is_some_and(|key| is_open(app, key, true));
     let rect = row_rect(ui);
-    if !ui.is_rect_visible(rect) && !patterns_open && !(folder == "bodies" && app.tree.reveal.as_deref() == Some(e.key.as_str())) {
+    let revealed = folder == "bodies" && app.tree.reveal.as_ref().is_some_and(|b| e.row_key.strip_prefix("b:") == Some(b.as_str()));
+    if !ui.is_rect_visible(rect) && !patterns_open && !revealed {
         ui.allocate_space(rect.size());
         return;
     }
@@ -2477,10 +2480,7 @@ fn entry_row(
     }
     if r.double && folder == "sketches" {
         if let Ok(id) = e.key.parse() {
-            if let Some(path) = path {
-                let _ = app.run("component.activate", json!({"component": comp,"occurrence":path.last(),"path":path}));
-            }
-            app.edit_sketch(id);
+            app.edit_sketch_in(id, path.map(|path| (comp, path)));
         }
     } else if r.clicked {
         let shift = ui.input(|i| i.modifiers.shift);

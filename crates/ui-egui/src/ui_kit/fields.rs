@@ -291,6 +291,22 @@ pub(crate) fn dropdown_menu_with_close_behavior(
     close_behavior: egui::PopupCloseBehavior,
     add: impl FnOnce(&mut Ui),
 ) -> Response {
+    dropdown_menu_width(ui, id, current, false, close_behavior, add)
+}
+
+/// Intrinsic-width variant for horizontal toolbars and bottom strips.
+pub(crate) fn compact_dropdown_menu(ui: &mut Ui, id: impl egui::AsIdSalt, current: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    dropdown_menu_width(ui, id, current, true, egui::PopupCloseBehavior::CloseOnClick, add)
+}
+
+fn dropdown_menu_width(
+    ui: &mut Ui,
+    id: impl egui::AsIdSalt,
+    current: &str,
+    compact: bool,
+    close_behavior: egui::PopupCloseBehavior,
+    add: impl FnOnce(&mut Ui),
+) -> Response {
     crate::prefs_search::note_current(ui, current);
     // Only a search probe may skip the real control. A dialog's first frame is not visible yet,
     // and a stand-in there makes the next frame too short to show OK.
@@ -299,8 +315,14 @@ pub(crate) fn dropdown_menu_with_close_behavior(
     {
         return crate::prefs_search::hidden_response(ui);
     }
+    let t = Tokens::get();
+    let width = if compact {
+        ui.painter().layout_no_wrap(current.to_owned(), egui::FontId::proportional(t.font_label), t.form_ink).size().x + t.space_24 + t.space_8
+    } else {
+        dimension(ui.available_width())
+    };
     let response = egui::ComboBox::from_id_salt(id)
-        .width(dimension(ui.available_width()))
+        .width(width)
         .height(Tokens::get().space_24 * 14.0)
         .selected_text(current)
         .icon(dropdown_arrow)
@@ -466,7 +488,23 @@ fn cell_editor_frame(ui: &mut Ui, id: egui::Id, value: &mut String, hint: &str, 
 
 /// Search input with native accessibility and a stable caller ID. Tokens: cell_editor tokens.
 pub(crate) fn search_field(ui: &mut Ui, id: egui::Id, value: &mut String, hint: &str) -> Response {
-    cell_editor(ui, id, value, hint, false)
+    if !super::layout::in_catalog(ui) {
+        return cell_editor(ui, id, value, hint, false);
+    }
+    let t = Tokens::get();
+    let editor = text_input(egui::TextEdit::singleline(value))
+        .id(id)
+        .char_limit(128)
+        .hint_text(hint)
+        .min_size(vec2(0.0, t.space_16 + t.space_2))
+        .margin(egui::Margin { left: t.space_24 as i8, right: t.space_8 as i8, top: 0, bottom: 0 })
+        .font(egui::FontId::proportional(t.font_small))
+        .text_color(t.form_ink);
+    let response = ui.add_sized(vec2(dimension(ui.available_width()), t.space_16 + t.space_2), editor);
+    let icon = egui::Rect::from_center_size(egui::pos2(response.rect.left() + t.space_12, response.rect.center().y), vec2(t.space_12, t.space_12));
+    crate::icons::paint_ink(ui.painter(), icon, "zoom", t.form_dim);
+    super::layout::publish_geometry(ui, &response);
+    response
 }
 
 /// Search on application chrome uses the shell palette, including custom themes.

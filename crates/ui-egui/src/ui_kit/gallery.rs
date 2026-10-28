@@ -131,6 +131,13 @@ const ELEMENTS: &[Element] = &[
             assert_eq!(tree_row(ui, ui.id().with(("tree_geometry", index)), row).rect, Some(rect));
         }
     }),
+    element!("icon_label_action", |ui, _| {
+        icon_label_action(ui, "Render Image", Some("play"), true, true);
+    }),
+    element!("completion_text", |ui, _| {
+        completion_text(ui, "Render 1 · 1920 × 1080", true);
+        completion_text(ui, "No completed image", false);
+    }),
     element!("tree_row", |ui, _| {
         let actions = [TreeAction { icon: "plus", hover_only: false, label: "Add", reason: None, target: "gallery:tree:add" }];
         tree_row(ui, ui.id().with("tree_plain"), &Row { label: "Objects", fold: Some(true), actions: &actions, ..Default::default() });
@@ -162,6 +169,75 @@ const ELEMENTS: &[Element] = &[
         let actions =
             [TreeAction { icon: "lookat", hover_only: true, label: "Solo", reason: Some("Not available yet"), target: "gallery:tree:solo" }];
         tree_row(ui, ui.id().with("tree_actions"), &Row { label: "Light", actions: &actions, ..Default::default() });
+    }),
+    element!("catalog_scope", |ui, state| {
+        catalog_scope(ui, |ui| {
+            search_field(ui, ui.id().with("catalog_search"), &mut state.value, "Search appearances");
+            segmented(
+                ui,
+                &mut state.selected,
+                &["In Design", "Library", "Recent", "★"],
+                Segments { compact: true, proportional: true, workspace_accent: true, ..Default::default() },
+            );
+            ui.horizontal(|ui| {
+                choice_chip(ui, "catalog_all", "All", true);
+                choice_chip(ui, "catalog_metal", "Metal", false);
+            });
+            catalog_footer(ui, "Click to apply · drag onto the model");
+        });
+    }),
+    element!("catalog_footer", |ui, _| {
+        catalog_footer(ui, "Click to apply · drag onto the model");
+    }),
+    element!("sphere_grid", |ui, _| {
+        let sphere = Sphere { color: Tokens::get().render_accent, kind: FinishKind::Satin, opacity: None };
+        let tiles = ["gallery:grid:a", "gallery:grid:b", "gallery:grid:c"].map(|id| SphereTile {
+            id,
+            name: "Satin",
+            sphere,
+            selected: id.ends_with('b'),
+            users: 1,
+            tip: "Satin",
+        });
+        sphere_grid(ui, &tiles);
+    }),
+    element!("sphere_tile", "gallery:tile", Some("gallery:tile"), |ui, _| {
+        SphereTile {
+            id: "gallery:tile",
+            name: "Satin metal",
+            sphere: Sphere { color: Tokens::get().render_accent, kind: FinishKind::Metal, opacity: None },
+            selected: true,
+            users: 3,
+            tip: "Satin metal",
+        }
+        .show(ui);
+    }),
+    element!("strip_toggle", |ui, _| {
+        ui.horizontal(|ui| {
+            strip_toggle(ui, true, "Hide Shots strip");
+            strip_toggle(ui, false, "Shots");
+        });
+    }),
+    element!("strip_heading", |ui, _| {
+        StripHeading::new(ui.painter(), "History").show(ui);
+    }),
+    element!("choice_chip_selected", |ui, _| {
+        choice_chip(ui, "saved", "Hero", true);
+    }),
+    element!("add_choice", |ui, _| {
+        add_choice(ui, "Save Shot");
+    }),
+    element!("compact_dropdown_menu", |ui, _| {
+        compact_dropdown_menu(ui, "gallery_strip_size", "1920 × 1080", |ui| {
+            list_picker(ui, "full_hd", "Full HD", true);
+        });
+    }),
+    element!("thumbnail_choice", |ui, _| {
+        ui.horizontal(|ui| {
+            thumbnail_choice(ui, "hero", "Hero", ThumbnailChoice { selected: true, modified: true, ..Default::default() });
+            thumbnail_choice(ui, "front", "Front", ThumbnailChoice { progress: Some(0.6), ..Default::default() });
+            add_choice(ui, "Save Shot");
+        });
     }),
     element!("settings_form", |ui, state| {
         settings_form(ui, Tokens::get().form_label_width, |ui| {
@@ -821,6 +897,15 @@ const ELEMENTS: &[Element] = &[
                 row.cell(|ui| {
                     cell_editor(ui, ui.id().with("value"), &mut s.value, "", false);
                 });
+            });
+        });
+    }),
+    element!("name_list", "dialog:table:gallery_names:Bracket.solidcraft", None, |ui, _| {
+        name_list(ui, "gallery_names", &["Name", "Size", "Actions"], "No files", |list| {
+            list.row("Bracket.solidcraft", |row| {
+                row.name("Bracket.solidcraft");
+                row.cell(|ui| text(ui, "12.3 KB", Text::Inline));
+                row.cell(|ui| button(ui, "Open", Button::Small));
             });
         });
     }),

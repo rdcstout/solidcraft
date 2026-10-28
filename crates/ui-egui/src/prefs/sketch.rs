@@ -13,12 +13,18 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             .on_hover_text(crate::i18n::tr_label(
                 "Before the first point, pressing a sketch tool's shortcut again steps through its creation modes. Off: it starts the tool again.",
             ));
+        let dimension = setting::sketch_auto_dimensions(app, ui);
+        crate::scenario::publish_handle("prefs:sketch_auto_dimensions", dimension.rect.center());
+        ui.add_enabled_ui(app.preferences.sketch_auto_dimensions, |ui| {
+            let locate = setting::sketch_auto_locate(app, ui);
+            crate::scenario::publish_handle("prefs:sketch_auto_locate", locate.rect.center());
+        });
         ui_kit::settings_block_hint(ui, app.tr("prefs.hold_stop_snapping"), app.tr("prefs.snap_drawing_note"), t.space_24 * 8.0 + t.space_8, |ui| {
             let combo = &mut app.preferences.suppress_sketch_snap;
             ui_kit::settings_control_width(ui, t.space_24 * 7.0 + t.space_12, |ui| {
-                ui_kit::dropdown_menu(ui, "pref_suppress_sketch_snap", &combo.label(), |ui| {
+                ui_kit::dropdown_menu(ui, "pref_suppress_sketch_snap", &combo.shown_label(), |ui| {
                     for choice in ModifierCombo::SNAP_SUPPRESS_CHOICES {
-                        if ui_kit::list_picker(ui, &choice.label(), &choice.label(), *combo == choice).clicked() {
+                        if ui_kit::list_picker(ui, &choice.label(), &choice.shown_label(), *combo == choice).clicked() {
                             *combo = choice;
                         }
                     }

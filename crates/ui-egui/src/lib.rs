@@ -285,6 +285,7 @@ pub mod ui_kit;
 mod ui_kit_guard_tests;
 pub mod update;
 mod value_step;
+pub(crate) mod view_angles;
 mod view_confirm;
 pub mod view_pick;
 pub mod viewport;
@@ -433,6 +434,16 @@ pub struct PreSketchView {
     pub facing: Camera,
 }
 
+/// The active component (and placement) before a sketch opened inside another one (#8127), and
+/// the component the sketch opened in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreSketchComponent {
+    pub sketch: u64,
+    pub component: u64,
+    pub path: Option<Vec<u64>>,
+    pub opened_in: u64,
+}
+
 pub struct SolveApp {
     /// Compact browser embed: retain model panels and joint controls without application chrome.
     pub embedded: bool,
@@ -450,6 +461,9 @@ pub struct SolveApp {
     /// The views around opening the open sketch. Leaving it goes back to the earlier one as the
     /// "When a sketch ends" preference says (#7038).
     pub pre_sketch_cam: Option<PreSketchView>,
+    /// The component active before Edit Sketch activated the one the sketch is in (#8127);
+    /// leaving the sketch makes it active again.
+    pub pre_sketch_component: Option<PreSketchComponent>,
     pub services: Services,
     file_picker: Option<file_picker::Pending>,
     /// A slicer started alone and waited for before the file is sent (Send to Slicer).
@@ -669,6 +683,7 @@ impl SolveApp {
             now: 0.0,
             pre_sketch_marker: None,
             pre_sketch_cam: None,
+            pre_sketch_component: None,
             services,
             file_picker: None,
             slicer_wait: None,
@@ -1146,6 +1161,9 @@ impl SolveApp {
             {
                 self.ui.perspective = perspective;
             }
+            if id == "view.angle_readout" {
+                self.preferences.show_view_angles = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            }
             if matches!(id, "view.ambient_occlusion" | "view.graphics_preset") {
                 self.preferences.ambient_occlusion = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
                 if id == "view.graphics_preset" {
@@ -1296,6 +1314,20 @@ impl SolveApp {
             }
             return;
         }
+        // A drawing tool on the SKETCH tab kept shown outside a sketch (#7904) starts Create
+        // Sketch, on the selected plane or planar face or else on the plane picked next, and then
+        // the tool, as the tool's shortcut does outside a sketch (`keymap::press`).
+        if workspace::starts_a_sketch(self, id)
+            && let Some(then) = solidcraft_engine::find_command(id).map(|c| c.id)
+        {
+            self.start("sketch.create");
+            if let Some(d) = self.dialog.as_mut().filter(|d| matches!(d.kind, dialogs::Kind::Sketch)) {
+                d.then_start = Some(then);
+            }
+            // The ribbon stays on SKETCH while the plane is picked, not on Create Sketch's MODEL.
+            self.ui.tab = "SKETCH".into();
+            return;
+        }
         // A disabled command starts nothing, however it was reached. The toolbar greys its
         // button, but a shortcut, the command palette and the control channel all land here.
         // Its reason goes to the status line, so the refusal is never silent.
@@ -1369,6 +1401,10 @@ impl SolveApp {
         }
         if id == "view.perspective" {
             let _ = self.run(id, json!({"enabled": !self.ui.perspective}));
+            return;
+        }
+        if id == "view.angle_readout" {
+            let _ = self.run(id, json!({"enabled": !self.preferences.show_view_angles}));
             return;
         }
         // Another command ends Edit Text (its dialog is not a feature edit to keep).
@@ -1666,9 +1702,22 @@ impl SolveApp {
     /// it, and remember the marker so Finish Sketch puts it back. Editing the sketch that is already open does nothing; editing another one
     /// finishes the current sketch first, so edit sessions never nest.
     pub fn edit_sketch(&mut self, id: u64) {
+        self.edit_sketch_in(id, None);
+    }
+
+    /// Edit a sketch as [`SolveApp::edit_sketch`] does, in one placement of its component (a
+    /// sketch row inside a component in the browser): that component is active while the sketch
+    /// is open, and the one active before comes back when the sketch ends (#8127).
+    pub fn edit_sketch_in(&mut self, id: u64, placement: Option<(u64, &[u64])>) {
+        let activate = |app: &mut Self| {
+            if let Some((component, path)) = placement {
+                let _ = app.run("component.activate", json!({"component": component, "occurrence": path.last(), "path": path}));
+            }
+        };
         if let solidcraft_engine::doc::FaceAttachmentStatus::Lost { message, .. } =
             self.session.placed_document().sketch_face_attachment(id, &self.session.model)
         {
+            activate(self);
             browser::redefine_sketch(self, id);
             self.set_status(message, true);
             return;
@@ -1679,17 +1728,37 @@ impl SolveApp {
         let Some(idx) = self.session.doc.feature_index(id) else { return };
         let marker = self.finish_sketch_for_edit();
         let before = self.settled_cam();
+        let context = (self.session.active_component, self.session.active_occurrence_path.clone());
         self.tool = None;
         self.dialog = None;
+        activate(self);
         let rolled = self.session.doc.marker != Some(idx + 1) && self.run("timeline.roll_to", json!({ "position": idx + 1 })).is_ok();
         if self.run("sketch.edit", json!({ "sketch": id })).is_err() {
             if rolled || marker != self.session.doc.marker {
                 self.restore_marker(marker);
             }
+            self.restore_component(context.0, context.1);
             return;
         }
         self.pre_sketch_marker = (rolled || marker != self.session.doc.marker).then_some(marker);
+        // `sketch.edit` itself activates the component a face-attached sketch was drawn in.
+        let opened_in = self.session.active_component;
+        let moved = (opened_in, &self.session.active_occurrence_path) != (context.0, &context.1);
+        self.pre_sketch_component = moved.then_some(PreSketchComponent { sketch: id, component: context.0, path: context.1, opened_in });
         self.look_at_opened_sketch(before);
+    }
+
+    /// Make a component active again, in the placement it was active in.
+    fn restore_component(&mut self, component: u64, path: Option<Vec<u64>>) {
+        if (self.session.active_component, &self.session.active_occurrence_path) == (component, &path) {
+            return;
+        }
+        let mut p = json!({ "component": component });
+        if let Some(path) = path {
+            p["occurrence"] = json!(path.last());
+            p["path"] = json!(path);
+        }
+        let _ = self.run("component.activate", p);
     }
 
     /// Turn the view to face the sketch just opened, and remember the view from `before` it and
@@ -1744,6 +1813,10 @@ impl SolveApp {
         }
         if let Some(marker) = self.pre_sketch_marker.take() {
             self.restore_marker(marker);
+        }
+        // Unless another component was activated meanwhile: that one stays.
+        if let Some(pre) = self.pre_sketch_component.take().filter(|pre| Some(pre.sketch) == open && pre.opened_in == self.session.active_component) {
+            self.restore_component(pre.component, pre.path);
         }
         // Only the views saved when this sketch opened: one opened another way saved none.
         if let Some(view) = self.pre_sketch_cam.take().filter(|v| Some(v.sketch) == open)
@@ -2316,6 +2389,7 @@ impl SolveApp {
         if !self.ui.show_browser || render_ui::focused(self) {
             self.shell.browser = None;
             shell::register_panel(self, "render:browser", None, None);
+            shell::register_panel(self, "render:appearances", None, None);
         }
         if floating || left_timeline || !show_timeline {
             self.shell.history = None;
@@ -2526,9 +2600,12 @@ impl SolveApp {
 
     fn issue_screenshots(&mut self, ctx: &egui::Context) {
         let now = now_ms();
+        // A view that just moved is drawn with fewer AO samples: shoot the full-quality frame
+        // that follows (#7165), or after half a second a view that keeps moving as it is.
+        let settled = viewport::ao_settled(self, ctx);
         self.queued_shots.retain_mut(|(token, at, frames)| {
             *frames += 1;
-            if now >= *at && *frames >= 3 {
+            if now >= *at && *frames >= 3 && (settled || now >= *at + 500.0) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(*token)));
                 false
             } else {

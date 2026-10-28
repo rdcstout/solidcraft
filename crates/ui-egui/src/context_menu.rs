@@ -440,6 +440,14 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         if item.id != "ui.appearance" {
             continue;
         }
+        // A selected browser body keeps the selection for the editor and its quick choices.
+        // A row outside the selection still targets only the body that was right-clicked.
+        if let Target::Body { name } = target {
+            let bodies = sel_bodies(app);
+            if bodies.contains(name) {
+                item.params = Some(json!({"bodies": bodies}));
+            }
+        }
         let original = item.clone();
         let params = item.params.clone().unwrap_or_else(|| {
             let faces: Vec<_> = app
@@ -1114,6 +1122,12 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
     v.push(act("ui.paste", "Paste", "paste").key("Ctrl+V").on(app.session.sketch_clipboard.is_some()));
     v.push(act("ui.delete", "Delete", "delete").key("Del"));
     v.push(cmd(app, "sketch.dimension", "Sketch Dimension").with(json!({ "entities": ents })).on(ents.len() <= 2));
+    // One arc alone: Sketch Dimension gives its radius, this its length along the curve (#6039).
+    if let [arc] = ents.as_slice()
+        && ss.sketch.curve_index(arc).and_then(|i| ss.sketch.curves.get(i)).is_some_and(|c| matches!(c.kind, CurveKind::Arc { .. }))
+    {
+        v.push(cmd(app, "sketch.dimension", "Arc Length Dimension").with(json!({ "entities": [arc], "type": "arc_length" })));
+    }
     let mut c = Vec::new();
     let n = ents.len();
     let (l, r, p) = (lines.len(), rounds.len(), points.len());
@@ -2060,6 +2074,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     };
 
     let had_submenu = app.menu.submenu.is_some();
+    let leaving = app.menu.submenu_leave.is_some();
     let enabled: Vec<_> = list.iter().map(|i| i.enabled && !i.is_sep() && !i.is_heading()).collect();
     if app.menu.submenu.is_none() {
         let enter = crate::ui_kit::Menu::navigate(ctx, &enabled, &mut app.menu.key_row);
@@ -2101,7 +2116,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             }
                             other_row |= row.hovered();
                         } else {
-                            let row = kit_item(item, key_row == Some(k) || app.menu.submenu == Some(k)).show(ui);
+                            let row = kit_item(item, key_row == Some(k) || (app.menu.submenu == Some(k) && !leaving)).show(ui);
                             // Appearance keeps its direct editor action as well as hover shortcuts.
                             if item.enabled && row.clicked() && item.id == "ui.appearance" {
                                 picked = Some(item.clone());

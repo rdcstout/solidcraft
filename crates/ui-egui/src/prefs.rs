@@ -56,6 +56,7 @@ impl NavKeys {
     const NONE: NavKeys = NavKeys { shift: false, ctrl: false, alt: false };
     const SHIFT: NavKeys = NavKeys { shift: true, ctrl: false, alt: false };
     const CTRL: NavKeys = NavKeys { shift: false, ctrl: true, alt: false };
+    const ALT: NavKeys = NavKeys { shift: false, ctrl: false, alt: true };
     const SHIFT_ALT: NavKeys = NavKeys { shift: true, ctrl: false, alt: true };
 
     /// All of these keys are held (Ctrl is Cmd on macOS).
@@ -99,7 +100,7 @@ use NavButton::{Left, Middle, Right};
 use NavMode::{Orbit, Pan, Zoom};
 
 /// The mouse mappings. The first is the default.
-pub const NAV_PRESETS: [NavPreset; 8] = [
+pub const NAV_PRESETS: [NavPreset; 10] = [
     NavPreset {
         id: "fusion",
         label: "Fusion",
@@ -146,6 +147,18 @@ pub const NAV_PRESETS: [NavPreset; 8] = [
         ],
     },
     NavPreset {
+        id: "maya",
+        label: "Maya",
+        help: "Alt+left drag orbits, Alt+middle pans, Alt+right zooms; middle drag also pans",
+        reverse_zoom: false,
+        bindings: &[
+            bind(Left, NavKeys::ALT, Orbit),
+            bind(Middle, NavKeys::ALT, Pan),
+            bind(Right, NavKeys::ALT, Zoom),
+            bind(Middle, NavKeys::NONE, Pan),
+        ],
+    },
+    NavPreset {
         id: "blender",
         label: "Blender",
         help: "Middle drag orbits, Shift+middle pans, Ctrl+middle zooms; right drag leaves the camera alone",
@@ -171,6 +184,15 @@ pub const NAV_PRESETS: [NavPreset; 8] = [
             bind(Right, NavKeys::NONE, Pan),
             bind(Middle, NavKeys::NONE, Pan),
         ],
+    },
+    NavPreset {
+        id: "hfss",
+        label: "HFSS",
+        help: "Alt+left drag pans, Shift+Alt+left zooms, Ctrl+left drag on empty space orbits",
+        reverse_zoom: false,
+        // Ctrl+left orbit is the drag from empty space every preset has: as a binding it would
+        // also take a Ctrl+click on geometry, which adds to the selection.
+        bindings: &[bind(Left, NavKeys::SHIFT_ALT, Zoom), bind(Left, NavKeys::ALT, Pan)],
     },
     NavPreset {
         id: TOUCHPAD_NAV,
@@ -792,6 +814,9 @@ preference_settings! {
     frame_rate_details: bool = false, PAGE_GRAPHICS;
     /// Draw a wider rim under finished sketch curves to improve contrast on shaded faces.
     sketch_halo: bool = false, PAGE_GRAPHICS => check("Halo under sketch curves");
+    /// Show the view's pitch, yaw and roll and its projection under the orientation gizmo (#6032).
+    /// Off by default; View ▸ View angles and `view.angle_readout` turn it on.
+    show_view_angles: bool = false, PAGE_GRAPHICS;
     /// Show world X/Y/Z component dimensions beside the total distance in Measure.
     measure_axis_distances: bool = true, PAGE_GRAPHICS => check_id("settings.measure_axis_distances");
     /// Decimals shown for lengths and angles.
@@ -810,6 +835,8 @@ preference_settings! {
     /// The 3D view's colours: the theme's own, or the Light or Dark theme's whatever the window
     /// uses (#4146).
     viewport_theme: crate::theme::ViewportTheme = crate::theme::ViewportTheme::Theme, PAGE_INTERFACE;
+    /// The application bar's logo in the theme's accent instead of the theme's logo colours.
+    logo_accent: bool = false, PAGE_INTERFACE;
     /// Imported theme files (`theme_files`), kept here so they also work in the browser.
     custom_themes: Vec<crate::theme_files::ThemeFile> = Vec::new();
     /// Desktop: a `solidcraft-theme/1` file another tool writes, followed as the theme and
@@ -824,6 +851,9 @@ preference_settings! {
     navigation_bar: crate::navigation_bar::NavigationBar = Default::default(), PAGE_INTERFACE;
     /// Show command names beneath ribbon icons, independently of workspace layout.
     ribbon_labels: bool = true, PAGE_INTERFACE;
+    /// Keep the SKETCH tab in the ribbon, right after MODEL, while no sketch is open; its drawing
+    /// tools then start a sketch first (#7904).
+    sketch_tab_always: bool = false, PAGE_INTERFACE => check_id("prefs.sketch_tab_always");
     /// Where a dialog's OK and Cancel sit: under its inputs (the default) or in its title row (#6708).
     dialog_buttons: crate::ui_kit::DialogButtons = Default::default(), PAGE_INTERFACE;
     /// Interface scale (1 = 100 %).
@@ -861,6 +891,9 @@ preference_settings! {
     render_inspector_width: f32 = 305.0;
     render_browser_side: String = "left".into();
     render_browser_width: f32 = 266.0;
+    /// Resource identities and history belong to the user, never the design.
+    render_library_favorites: std::collections::BTreeSet<(String, String)> = Default::default();
+    render_library_recent: std::collections::VecDeque<(String, String)> = Default::default();
     /// Draw the parts browser on a translucent card over the 3D view instead of a column of its
     /// own, so the workspace keeps the whole window width.
     browser_float: bool = false, PAGE_INTERFACE;
@@ -879,6 +912,8 @@ preference_settings! {
     trackpad_pan: bool = true, PAGE_NAVIGATION;
     /// Horizontal trackpad and thumb-wheel scrolling pans the view the other way (#2007).
     pan_reverse_x: bool = false, PAGE_NAVIGATION => check("Reverse horizontal pan direction", "Horizontal two-finger scrolling and the thumb wheel pan the other way");
+    /// Vertical trackpad scrolling pans the view the other way (#5240).
+    pan_reverse_y: bool = false, PAGE_NAVIGATION => check("Reverse vertical pan direction", "Vertical two-finger scrolling pans the other way");
     /// View changes (axis view, Look At, Home) animate; `look_at_speed` scales how fast.
     look_at_anim: bool = true, PAGE_NAVIGATION => check("Animate view changes", "Axis view, Look At, Home and Fit");
     look_at_speed: f32 = 1.0, PAGE_NAVIGATION, accept(0.25..=4.0) => enabled_slider(look_at_anim, "Animation speed", 0.5..=3.0, 0.25, |v| format!("{v:.2}×"));
@@ -999,6 +1034,20 @@ preference_settings! {
     shortcut_cycles_modes: bool = false, PAGE_SKETCH;
     /// Where the view goes when a sketch ends (#7038). Keep (the default) leaves it as it is.
     sketch_exit_view: SketchExitView = SketchExitView::default(), PAGE_SKETCH;
+    /// A shape drawn in a sketch gets all its dimensions at once: the typed values, and every
+    /// other size the shape has at its size as drawn (`sketch.draw.dimensioned` with `as_drawn`).
+    /// Shapes `solidcraft_engine::dimension_roles` doesn't list are drawn as before.
+    sketch_auto_dimensions: bool = false, PAGE_SKETCH => check(
+        "Dimension new shapes",
+        "Each shape you draw gets all its dimensions, at the sizes you drew (typed values win). A size the sketch already sets is left out."
+    );
+    /// With `sketch_auto_dimensions`: new shapes are also placed from the sketch origin until they
+    /// are fully constrained (`sketch.draw.dimensioned` with `locate`). A shape already anchored to
+    /// the origin or to placed geometry gets nothing more.
+    sketch_auto_locate: bool = false, PAGE_SKETCH => check(
+        "Also place them from the origin (fully constrained)",
+        "Each new shape is also dimensioned from the sketch origin until nothing of it is left free. A shape already attached to the origin or to placed geometry gets none."
+    );
     /// When true: Shift+click adds without removing; Primary toggles.
     /// When false (default): Shift and Primary both toggle.
     selection_shift_add_only: bool = false, PAGE_SKETCH;
@@ -1487,6 +1536,9 @@ pub fn apply(app: &mut SolveApp, ctx: &egui::Context) {
     if crate::theme::set_custom(custom) {
         app.styled = false;
     }
+    if crate::theme::set_logo_accent(app.preferences.logo_accent) {
+        app.styled = false;
+    }
     // egui's end-of-frame shortcuts only change its context; the saved preference would
     // overwrite that change next frame. Consume the desktop shortcuts into the preference.
     if ctx.options(|o| o.zoom_with_keyboard) && !crate::keymap::capturing(app) {
@@ -1564,6 +1616,11 @@ pub fn nav_mode(app: &SolveApp, button: NavButton, mods: Modifiers) -> Option<Na
 /// +1, or −1 when horizontal scrolling pans the other way (#2007).
 pub fn pan_sign_x(app: &SolveApp) -> f32 {
     if app.preferences.pan_reverse_x { -1.0 } else { 1.0 }
+}
+
+/// +1, or −1 when vertical scrolling pans the other way.
+pub fn pan_sign_y(app: &SolveApp) -> f32 {
+    if app.preferences.pan_reverse_y { -1.0 } else { 1.0 }
 }
 
 /// Whether the configured suppress-snap chord is held.
@@ -2657,6 +2714,9 @@ pub fn migrate(mut p: Prefs) -> Prefs {
     if p.agent_chat_turn_limit == crate::agent_chat::gate::OLD_DEFAULT_TURN_LIMIT {
         p.agent_chat_turn_limit = 0;
     }
+    let valid_resource = |(kind, id): &(String, String)| !kind.is_empty() && kind.len() <= 64 && !id.is_empty() && id.len() <= 4096;
+    p.render_library_favorites = p.render_library_favorites.into_iter().filter(valid_resource).take(256).collect();
+    p.render_library_recent = p.render_library_recent.into_iter().filter(valid_resource).take(32).collect();
     if p.orbit_cursor {
         p.orbit_around = OrbitAround::Cursor;
         p.orbit_cursor = false;
@@ -4276,6 +4336,7 @@ mod tests {
             ("ui_font", json!("test font"), PAGE_INTERFACE),
             ("layout", json!("compact"), PAGE_INTERFACE),
             ("ribbon_labels", json!(false), PAGE_INTERFACE),
+            ("sketch_tab_always", json!(true), PAGE_INTERFACE),
             ("dialog_buttons", json!("top"), PAGE_INTERFACE),
             ("timeline_left", json!(true), PAGE_INTERFACE),
             ("timeline_under_browser", json!(true), PAGE_INTERFACE),
@@ -5069,6 +5130,39 @@ mod tests {
             .collect()
     }
 
+    /// The Interface page's tab colour strip names each tab as the ribbon does, in every language.
+    #[test]
+    fn tab_accent_strip_names_the_tabs_as_the_ribbon_does() {
+        use crate::workspace::tab_name;
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, out)),
+                _ => {}
+            }
+        }
+        let h = crate::scenario::Harness::new();
+        for (lang, want) in [
+            ("en", ["Model", "Surface", "Mesh", "Form", "Sheet Metal", "Render"]),
+            ("de", ["Modell", "Fläche", "Mesh", "Form", "Blech", "Rendern"]),
+            ("fr", ["Modèle", "Surface", "Maillage", "Forme", "Tôlerie", "Rendu"]),
+        ] {
+            let _scope = crate::i18n::scope(lang);
+            let got = ["MODEL", "SURFACE", "MESH", "FORM", "SHEET METAL", "RENDER"].map(tab_name);
+            assert_eq!(got, want, "{lang}");
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 200.0));
+            let mut out = h.ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                crate::ui_kit::scope(ui, crate::ui_kit::tab_accent_strip);
+            });
+            out.textures_delta.clear();
+            let mut painted = Vec::new();
+            out.shapes.iter().for_each(|shape| texts(&shape.shape, &mut painted));
+            for name in want {
+                assert!(painted.iter().any(|p| p == name), "{lang}: the strip paints {painted:?}, not {name}");
+            }
+        }
+    }
+
     /// Origin plane names (#6491): Top, Front and Right are names shown in the browser, the
     /// dialogs' chips and the plane choices; the planes' ids, the commands and the design keep XY,
     /// XZ and YZ. Saved, refused when unknown, and taken back by Cancel and Restore Defaults.
@@ -5136,6 +5230,22 @@ mod tests {
         assert!(OriginPlaneNames::PLANES.iter().all(|p| rows().iter().any(|r| r == p)), "{:?}", rows());
         h.call("ui.prefs", json!({"button":"cancel"}));
         assert_eq!(h.app.preferences.origin_plane_names, TopFrontRight);
+    }
+
+    /// The snap-suppress choice and Direct interaction read in the user's language: the classic
+    /// choice's "or" was English in every language, and Direct interaction had no message.
+    #[test]
+    fn modifier_choice_and_direct_interaction_are_translated() {
+        let _japanese = crate::i18n::scope("ja");
+        let either = crate::tool_modifiers::ModifierCombo::CTRL_ALT.shown_label();
+        assert!(either.contains(" または ") && !either.contains(" or "), "{either}");
+        assert_ne!(crate::tool_modifiers::ModifierCombo::NONE.shown_label(), "None");
+        for english in [
+            "Direct interaction",
+            "Work on the model directly in the viewport. Press a flat face or a profile and pull: up extrudes, down into a body cuts, and sideways movement sets the step size",
+        ] {
+            assert_ne!(crate::i18n::tr_label(english), english);
+        }
     }
 
     #[test]
@@ -5389,6 +5499,23 @@ mod tests {
     }
 
     #[test]
+    fn pan_reverse_y_defaults_off_persists_and_flips_the_sign() {
+        assert!(!serde_json::from_value::<Prefs>(json!({})).unwrap().pan_reverse_y);
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        assert_eq!(pan_sign_y(&app), 1.0);
+        set(&mut app, &json!({"pan_reverse_y": true})).unwrap();
+        assert_eq!(pan_sign_y(&app), -1.0);
+        assert_eq!(pan_sign_x(&app), 1.0);
+        set(&mut app, &json!({"pan_reverse_x": true, "pan_reverse_y": false})).unwrap();
+        assert_eq!(pan_sign_x(&app), -1.0);
+        assert_eq!(pan_sign_y(&app), 1.0);
+        set(&mut app, &json!({"pan_reverse_y": true})).unwrap();
+        let mut other = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        other.load_prefs(&app.prefs());
+        assert!(other.preferences.pan_reverse_y);
+    }
+
+    #[test]
     fn trackpad_pan_defaults_on_persists_and_follows_dialog_buttons() {
         assert!(serde_json::from_value::<Prefs>(json!({})).unwrap().trackpad_pan);
         assert!(Prefs::default().trackpad_pan);
@@ -5464,6 +5591,34 @@ mod tests {
         other.load_prefs(&app.prefs());
         assert_eq!(other.preferences, app.preferences);
         assert_eq!(format_length(25.4, "in", 3), "1.000 in");
+    }
+
+    /// #6474, #2742: Maya moves the camera with Alt and any button, HFSS with Alt or Shift+Alt and
+    /// the left button. A plain left drag still selects, and HFSS leaves Ctrl+left to the drag
+    /// from empty space every preset has, so a Ctrl+click on geometry still adds to the selection.
+    #[test]
+    fn maya_and_hfss_presets_navigate_with_alt() {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        let none = Modifiers::default();
+        let alt = Modifiers { alt: true, ..Default::default() };
+        let shift_alt = Modifiers { shift: true, alt: true, ..Default::default() };
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        set(&mut app, &json!({"nav": "maya"})).unwrap();
+        assert_eq!(nav_mode(&app, NavButton::Left, alt), Some(NavMode::Orbit));
+        assert_eq!(nav_mode(&app, NavButton::Middle, alt), Some(NavMode::Pan));
+        assert_eq!(nav_mode(&app, NavButton::Right, alt), Some(NavMode::Zoom));
+        assert_eq!(nav_mode(&app, NavButton::Middle, none), Some(NavMode::Pan));
+        assert_eq!(nav_mode(&app, NavButton::Left, none), None, "a plain left drag selects");
+        assert_eq!(nav_mode(&app, NavButton::Right, none), None, "a plain right click opens the context menu");
+        set(&mut app, &json!({"nav": "hfss"})).unwrap();
+        assert_eq!(nav_mode(&app, NavButton::Left, alt), Some(NavMode::Pan));
+        assert_eq!(nav_mode(&app, NavButton::Left, shift_alt), Some(NavMode::Zoom));
+        assert_eq!(nav_mode(&app, NavButton::Left, none), None);
+        assert_eq!(nav_mode(&app, NavButton::Left, ctrl), None);
+        assert_eq!(zoom_sign(&app), 1.0);
+        let mut other = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        other.load_prefs(&app.prefs());
+        assert_eq!(other.preferences.nav, "hfss");
     }
 
     /// The dialog: changes apply at once, Cancel puts back what was there when it opened, Apply
@@ -5730,6 +5885,16 @@ mod ui_scale_regression_tests {
         h.call("ui.prefs", json!({"button":"cancel"}));
         assert_eq!(h.app.preferences.ui_scale, 1.0, "Cancel restores the original scale");
         assert_eq!(h.ctx.zoom_factor(), 1.0);
+    }
+}
+
+/// View ▸ View angles and Preferences ▸ Graphics run the same command (#6032).
+pub(crate) fn view_angles_checkbox(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let mut enabled = app.preferences.show_view_angles;
+    let response = ui_kit::checkbox(ui, crate::i18n::tr("ui.view_angles"), &mut enabled).on_hover_text(crate::i18n::tr("ui.view_angles_help"));
+    crate::scenario::publish_handle("view:view_angles", response.rect.center());
+    if response.changed() {
+        let _ = app.run("view.angle_readout", json!({"enabled": enabled}));
     }
 }
 
