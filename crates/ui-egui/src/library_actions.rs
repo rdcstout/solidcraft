@@ -24,13 +24,13 @@ pub(super) struct Dialog {
 
 fn label(action: Action) -> &'static str {
     match action {
-        Action::Open => "Open",
-        Action::Insert => "Insert into Current Design",
-        Action::Rename => "Rename",
-        Action::Move => "Move",
-        Action::Copy => "Copy",
-        Action::Trash => "Move to Trash",
-        Action::Reveal => "Show in Folder",
+        Action::Open => crate::i18n::tr("library.action_open"),
+        Action::Insert => crate::i18n::tr("library.action_insert"),
+        Action::Rename => crate::i18n::tr("library.action_rename"),
+        Action::Move => crate::i18n::tr("library.action_move"),
+        Action::Copy => crate::i18n::tr("library.action_copy"),
+        Action::Trash => crate::i18n::tr("library.action_trash"),
+        Action::Reveal => crate::i18n::tr("library.action_reveal"),
     }
 }
 
@@ -84,7 +84,7 @@ pub(super) fn context_menu(app: &mut SolveApp, ui: &egui::Ui, response: &egui::R
 
 fn perform(app: &mut SolveApp, entry: Entry, action: Action) {
     let Some(path) = entry.path.to_str() else {
-        app.set_status("This filename is not valid UTF-8.", true);
+        app.set_status(crate::i18n::tr("library.utf8"), true);
         return;
     };
     match action {
@@ -122,15 +122,65 @@ fn perform(app: &mut SolveApp, entry: Entry, action: Action) {
 }
 
 fn execute(app: &mut SolveApp, entry: &Entry, action: Action, destination: Option<&std::path::Path>) -> bool {
-    let Some(path) = entry.path.to_str() else {
+    if app.file_picker_busy() || app.file_load.busy() {
         return false;
-    };
+    }
+    let Some(path) = entry.path.to_str() else { return false };
+    let path = path.to_owned();
     let command = match action {
         Action::Copy => "file.copy",
         Action::Trash => "file.trash",
         _ => "file.move",
     };
-    let result = app.run(command, json!({"path":path, "destination":destination}));
+    let params = json!({"path":path, "destination":destination});
+    let guards = crate::documents::file_guard_sessions(app);
+    let scope = solidcraft_engine::io::vfs::current_scope();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let protected = crate::i18n::tr("library.close_using_file").to_owned();
+    let language = crate::i18n::language();
+    let spawned = std::thread::Builder::new().name("library-file-action".into()).spawn(move || {
+        let _language = crate::i18n::scope(language);
+        let result = solidcraft_engine::io::vfs::scoped(scope, || {
+            if action != Action::Copy && guards.iter().any(|s| solidcraft_engine::session_uses_file(s, &path)) {
+                return (false, Err(protected));
+            }
+            (true, solidcraft_engine::Session::default().execute(command, &params).map_err(|e| e.to_string()))
+        });
+        let _ = tx.send(result);
+    });
+    if let Err(error) = spawned {
+        app.library.error = Some(crate::i18n::format("library.worker_start_failed", &[("error", &error.to_string())]));
+        return false;
+    }
+    let entry = entry.clone();
+    let destination = destination.map(std::path::Path::to_path_buf);
+    app.set_status(crate::i18n::tr("library.file_working"), false);
+    app.begin_file_task(
+        std::future::poll_fn(move |_| match rx.try_recv() {
+            Ok(result) => std::task::Poll::Ready(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => std::task::Poll::Pending,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => std::task::Poll::Ready((true, Err(crate::i18n::tr("library.worker_stopped").into()))),
+        }),
+        move |app, (attempted, result)| {
+            let _language = crate::i18n::scope(&app.preferences.language);
+            // A partial transfer may have written a destination even on failure.
+            if attempted {
+                app.library.refresh();
+            }
+            finish(app, &entry, action, destination.as_deref(), result);
+        },
+    );
+    true
+}
+
+fn finish(
+    app: &mut SolveApp,
+    entry: &Entry,
+    action: Action,
+    destination: Option<&std::path::Path>,
+    result: Result<serde_json::Value, String>,
+) -> bool {
+    let path = entry.path.to_str().unwrap_or_default();
     match result {
         Ok(_) => {
             if action != Action::Copy
@@ -149,10 +199,11 @@ fn execute(app: &mut SolveApp, entry: &Entry, action: Action, destination: Optio
                 }
                 app.home.recent.retain(|p| !p.is_empty());
             }
-            app.set_status(format!("{} completed.", label(action)), false);
+            app.set_status(crate::i18n::format("library.completed", &[("action", label(action))]), false);
             true
         }
         Err(error) => {
+            app.set_status(error.clone(), true);
             app.library.error = Some(error);
             false
         }
@@ -164,7 +215,7 @@ pub(super) fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
     let mut confirm = false;
     let mut cancel = false;
     let (closed, action) = crate::ui_kit::Window::new(egui::Id::new("library_file_action"), "folder", label(dialog.action))
-        .actions(label(dialog.action), "Cancel", None)
+        .actions(label(dialog.action), crate::i18n::tr("ui.cancel"), None)
         .fields()
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, true, |ui| {
@@ -185,7 +236,7 @@ pub(super) fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 confirm |= input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             } else {
-                ui.label("This file will go to the system Trash, where you can restore it.");
+                ui.label(crate::i18n::tr("library.confirm_trash"));
             }
             if let Some(error) = &dialog.error {
                 ui.label(error);
@@ -201,7 +252,7 @@ pub(super) fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
         let destination = if dialog.action == Action::Rename {
             let name = dialog.name.trim();
             if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-                dialog.error = Some("Enter a filename without directory separators.".into());
+                dialog.error = Some(crate::i18n::tr("library.invalid_name").into());
                 app.library.action_dialog = Some(dialog);
                 return;
             }
@@ -222,6 +273,48 @@ pub(super) fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
 mod tests {
     use super::*;
     use crate::scenario::Harness;
+
+    fn finish_job(h: &mut Harness) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while h.app.file_picker_busy() && std::time::Instant::now() < deadline {
+            crate::file_picker::tick(&mut h.app, &h.ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!h.app.file_picker_busy());
+    }
+
+    #[test]
+    fn background_file_lock_keeps_frames_responsive_and_defers_opens() {
+        let mut h = Harness::new();
+        let e = entry(&h);
+        let before = h.app.session.doc.to_json();
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.begin_file_task(
+            std::future::poll_fn(move |_| match rx.try_recv() {
+                Ok(()) => std::task::Poll::Ready(()),
+                _ => std::task::Poll::Pending,
+            }),
+            |_, ()| {},
+        );
+        for width in [960, 1280] {
+            h.call("ui.resize", json!({"width":width,"height":720}));
+            h.frames(2);
+            assert_eq!(h.ctx.content_rect().width(), width as f32);
+            assert!(h.app.file_picker_busy());
+            assert!(h.app.run("file.trash", json!({"path":e.path})).is_err());
+            assert!(!execute(&mut h.app, &e, Action::Copy, Some(&h.dir.join("No.sc"))));
+            crate::documents::new_design(&mut h.app);
+            crate::documents::request_quit(&mut h.app);
+            assert_eq!(h.app.session.doc.to_json(), before);
+            assert!(!h.app.quit_requested);
+        }
+        crate::file_load::begin(&mut h.app, e.path.to_str().unwrap(), false);
+        h.frames(2);
+        assert!(h.app.file_load.features().is_none(), "queued opens must not start behind a file mutation");
+        assert!(h.app.session.path.is_none());
+        tx.send(()).unwrap();
+        finish_job(&mut h);
+    }
 
     fn entry(h: &Harness) -> Entry {
         let path = h.dir.join("MenuTest.solidcraft");
@@ -272,13 +365,17 @@ mod tests {
         h.app.library.set_highlight(&e.path, Some(Highlight::Green));
         let copied = h.dir.join("Copied.solidcraft");
         assert!(execute(&mut h.app, &e, Action::Copy, Some(&copied)));
+        finish_job(&mut h);
         assert_eq!(h.app.library.highlights.get(&e.path), Some(&Highlight::Green));
         assert!(!h.app.library.highlights.contains_key(&copied));
         let moved = h.dir.join("Renamed.solidcraft");
         assert!(execute(&mut h.app, &e, Action::Rename, Some(&moved)));
+        finish_job(&mut h);
         assert!(!h.app.library.highlights.contains_key(&e.path));
         assert_eq!(h.app.library.highlights.get(&moved), Some(&Highlight::Green));
-        assert!(!execute(&mut h.app, &e, Action::Rename, Some(&copied)));
+        assert!(execute(&mut h.app, &e, Action::Rename, Some(&copied)));
+        finish_job(&mut h);
+        assert!(h.app.library.error.is_some());
         assert_eq!(h.app.library.highlights.get(&moved), Some(&Highlight::Green));
     }
 
@@ -359,7 +456,9 @@ mod tests {
         }
         assert!(!h.app.library.loading(), "initial folder scan must finish before checking rejected operations");
         assert!(crate::documents::uses_file(&h.app, e.path.to_str().unwrap()));
-        assert!(!execute(&mut h.app, &e, Action::Trash, None));
+        assert!(execute(&mut h.app, &e, Action::Trash, None));
+        finish_job(&mut h);
+        assert!(h.app.library.error.is_some());
         assert!(h.app.run("file.trash", json!({"path":e.path})).is_err());
         assert!(h.app.run("file.move", json!({"path":e.path,"destination":h.dir.join("Moved.solidcraft")})).is_err());
         assert!(e.path.exists());
@@ -377,6 +476,7 @@ mod tests {
         }));
         perform(&mut h.app, e.clone(), Action::Copy);
         crate::file_picker::tick(&mut h.app, &h.ctx);
+        finish_job(&mut h);
         assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(&e.path).unwrap());
         h.app.services.pick_save = Some(Box::new(|_, _| Box::pin(std::future::ready(None))));
         perform(&mut h.app, e.clone(), Action::Copy);

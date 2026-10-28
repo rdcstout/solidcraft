@@ -66,10 +66,19 @@ struct Entry {
     folder: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FileStamp {
+    pub(super) bytes: u64,
+    pub(super) modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    pub(super) changed: (i64, i64),
+}
+
 #[derive(Default)]
 struct Listing {
     entries: Vec<Entry>,
     warning: Option<String>,
+    identities: BTreeMap<PathBuf, FileStamp>,
 }
 
 #[derive(Default)]
@@ -84,6 +93,9 @@ pub struct LibraryState {
     focused: Option<bool>,
     refresh_on_return: bool,
     listing: Listing,
+    filtered: Vec<usize>,
+    filter_key: Option<(String, usize)>,
+    listing_changed: bool,
     error: Option<String>,
     action_dialog: Option<actions::Dialog>,
     folders_expanded: bool,
@@ -143,7 +155,7 @@ impl LibraryState {
     fn set_highlight(&mut self, path: &Path, color: Option<Highlight>) {
         if let Some(color) = color {
             if path.to_str().is_none() {
-                self.error = Some("This filename is not valid UTF-8.".into());
+                self.error = Some(crate::i18n::tr("library.utf8").into());
                 return;
             }
             if self.highlights.contains_key(path) || self.highlights.len() < MAX_HIGHLIGHTS {
@@ -218,6 +230,7 @@ impl LibraryState {
     pub(super) fn refresh(&mut self) {
         self.refresh_on_return = false;
         self.listing = Listing::default();
+        self.filter_key = None;
         self.error = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -227,11 +240,13 @@ impl LibraryState {
             let Some(root) = self.root.clone() else { return };
             let current = self.current.clone();
             let (tx, rx) = std::sync::mpsc::channel();
+            let language = crate::i18n::language();
             match std::thread::Builder::new().name("document-library".into()).spawn(move || {
+                let _language = crate::i18n::scope(language);
                 let _ = tx.send(read_folder(&root, &current));
             }) {
                 Ok(_) => self.pending = Some(rx),
-                Err(error) => self.error = Some(format!("Could not scan this folder: {error}. Try Refresh.")),
+                Err(error) => self.error = Some(crate::i18n::format("library.scan_failed", &[("error", &error.to_string())])),
             }
         }
     }
@@ -243,14 +258,18 @@ impl LibraryState {
                 Ok(result) => {
                     self.pending = None;
                     match result {
-                        Ok(listing) => self.listing = listing,
+                        Ok(listing) => {
+                            self.listing = listing;
+                            self.filter_key = None;
+                            self.listing_changed = true;
+                        }
                         Err(error) => self.error = Some(error),
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
-                    self.error = Some("Folder scan stopped. Try Refresh or choose the folder again.".into());
+                    self.error = Some(crate::i18n::tr("library.scan_stopped").into());
                 }
             }
         }
@@ -272,6 +291,25 @@ impl LibraryState {
         }
     }
 
+    fn update_filter(&mut self) -> bool {
+        if self.filter_key.as_ref().is_some_and(|(query, len)| query == &self.search && *len == self.listing.entries.len()) {
+            return false;
+        }
+        let query = self.search.to_lowercase();
+        self.filtered.clear();
+        self.filtered.extend(
+            self.listing
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| query.is_empty() || entry.name.to_lowercase().contains(&query))
+                .map(|(index, _)| index),
+        );
+        self.filter_key = Some((self.search.clone(), self.listing.entries.len()));
+        true
+    }
+
+    #[cfg(test)]
     fn visible(&self) -> Vec<&Entry> {
         let query = self.search.to_lowercase();
         self.listing.entries.iter().filter(|entry| query.is_empty() || entry.name.to_lowercase().contains(&query)).collect()
@@ -280,27 +318,26 @@ impl LibraryState {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn read_folder(root: &Path, current: &Path) -> Result<Listing, String> {
-    let canonical_root =
-        root.canonicalize().map_err(|error| format!("Document folder unavailable: {error}. Reconnect it or choose another folder."))?;
-    let canonical_current = current.canonicalize().map_err(|error| format!("Folder unavailable: {error}. Return Home or try Refresh."))?;
+    let canonical_root = root.canonicalize().map_err(|error| crate::i18n::format("library.root_unavailable", &[("error", &error.to_string())]))?;
+    let canonical_current =
+        current.canonicalize().map_err(|error| crate::i18n::format("library.folder_unavailable", &[("error", &error.to_string())]))?;
     if !canonical_current.starts_with(&canonical_root) {
-        return Err("This folder is outside your document library. Return Home.".into());
+        return Err(crate::i18n::tr("library.outside").into());
     }
-    let contents =
-        std::fs::read_dir(current).map_err(|error| format!("Cannot read this folder: {error}. Check its permissions or choose another folder."))?;
+    let contents = std::fs::read_dir(current).map_err(|error| crate::i18n::format("library.read_failed", &[("error", &error.to_string())]))?;
     let mut result = Listing::default();
     let mut entries = Vec::new();
     for (index, entry) in contents.enumerate() {
         if index >= MAX_ENTRIES {
-            result.warning = Some("This folder has more than 10,000 items. Organize it into smaller project folders to see everything.".into());
+            result.warning = Some(crate::i18n::tr("library.limit").into());
             break;
         }
         let Ok(entry) = entry else {
-            result.warning = Some("Some items could not be read. Check folder permissions and try Refresh.".into());
+            result.warning = Some(crate::i18n::tr("library.partial_permissions").into());
             continue;
         };
         let Ok(kind) = entry.file_type() else {
-            result.warning = Some("Some items could not be read. Try Refresh.".into());
+            result.warning = Some(crate::i18n::tr("library.partial").into());
             continue;
         };
         // Do not follow symlinks or list special files. Only enumerate this directory;
@@ -315,6 +352,18 @@ fn read_folder(root: &Path, current: &Path) -> Result<Listing, String> {
             // Creation time puts externally copied designs first even when a copy preserves mtime.
             let newest = if kind.is_file() {
                 entry.metadata().ok().and_then(|metadata| {
+                    result.identities.insert(
+                        path.clone(),
+                        FileStamp {
+                            bytes: metadata.len(),
+                            modified: metadata.modified().ok(),
+                            #[cfg(unix)]
+                            changed: {
+                                use std::os::unix::fs::MetadataExt;
+                                (metadata.ctime(), metadata.ctime_nsec())
+                            },
+                        },
+                    );
                     let times = metadata.created().ok().into_iter().chain(metadata.modified().ok());
                     // Finder preserves birth time as well as mtime when duplicating a file.
                     // Unix change time still records when the new copy arrived.
@@ -369,7 +418,7 @@ fn open_entry(app: &mut SolveApp, entry: Entry) {
     } else if let Some(path) = entry.path.to_str() {
         crate::home::open_recent(app, path);
     } else {
-        app.set_status("This filename cannot be opened. Rename it to a valid UTF-8 filename and try again.", true);
+        app.set_status(crate::i18n::tr("library.open_utf8"), true);
     }
 }
 
@@ -377,16 +426,12 @@ fn messages(state: &LibraryState, ui: &mut egui::Ui) {
     if state.loading() {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label("Reading folder…");
+            ui.label(crate::i18n::tr("library.reading"));
         });
     } else if let Some(error) = &state.error {
         ui.label(error);
-    } else if state.visible().is_empty() {
-        ui.label(if state.search.is_empty() {
-            "No designs or project folders here yet. Save designs into this folder, then Refresh."
-        } else {
-            "No matching designs or folders."
-        });
+    } else if state.filtered.is_empty() {
+        ui.label(if state.search.is_empty() { crate::i18n::tr("library.empty") } else { crate::i18n::tr("library.no_matches") });
     }
     if let Some(warning) = &state.listing.warning {
         ui.label(warning);
@@ -470,26 +515,16 @@ fn sample_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
 }
 
 fn rows(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
-    let query = app.library.search.to_lowercase();
-    let indices: Vec<_> = app
-        .library
-        .listing
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| query.is_empty() || entry.name.to_lowercase().contains(&query))
-        .map(|(index, _)| index)
-        .collect();
     let mut chosen = None;
     let gap = ui.spacing().item_spacing.x;
     let width = (ui.available_width() - gap) / 2.0;
     let height = width * 0.75 + 32.0;
-    egui::ScrollArea::vertical().id_salt("library_list").show_rows(ui, height, indices.len().div_ceil(2), |ui, range| {
+    egui::ScrollArea::vertical().id_salt("library_list").show_rows(ui, height, app.library.filtered.len().div_ceil(2), |ui, range| {
         for row in range {
             ui.horizontal(|ui| {
                 for column in 0..2 {
                     let index = row * 2 + column;
-                    let Some(entry) = indices.get(index).and_then(|i| app.library.listing.entries.get(*i)).cloned() else { continue };
+                    let Some(entry) = app.library.filtered.get(index).and_then(|i| app.library.listing.entries.get(*i)).cloned() else { continue };
                     let texture =
                         if entry.folder { None } else { entry.path.to_str().and_then(|path| crate::home::document_thumbnail(app, ui.ctx(), path)) };
                     let active = !entry.folder && app.session.path.as_deref().map(Path::new) == Some(entry.path.as_path());
@@ -582,9 +617,9 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
             egui::Stroke::new(1.0, crate::theme::Tokens::get().border),
             egui::StrokeKind::Inside,
         );
-        home.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Document library Home"));
+        home.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::i18n::tr("library.home")));
         crate::scenario::publish_handle("library:home", home.rect.center());
-        if home.on_hover_text("Return to CAD folder").clicked() {
+        if home.on_hover_text(crate::i18n::tr("library.home_hint")).clicked() {
             go_home(app);
         }
         let (chevron, _) = ui.allocate_exact_size(egui::vec2(12.0, 24.0), egui::Sense::hover());
@@ -624,8 +659,8 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
             egui::Stroke::new(1.0, crate::theme::Tokens::get().border),
             egui::StrokeKind::Inside,
         );
-        let settings = settings.on_hover_text("Change CAD directory");
-        settings.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Change CAD directory"));
+        let settings = settings.on_hover_text(crate::i18n::tr("library.choose_folder"));
+        settings.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::i18n::tr("library.choose_folder")));
         crate::scenario::publish_handle("library:settings", settings.rect.center());
         if settings.clicked() {
             choose_folder(app);
@@ -692,7 +727,7 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
     }
     if app.library.root.is_none() {
         egui::Frame::NONE.fill(crate::theme::Tokens::get().field).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
-            ui.label("Sample designs only. Use the gear above to choose your CAD folder.");
+            ui.label(crate::i18n::tr("library.samples_note"));
         });
         ui.add_space(6.0);
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 0)).show(ui, |ui| sample_rows(app, ui));
@@ -726,9 +761,13 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
                     .corner_radius(t.control_radius)
                     .inner_margin(egui::Margin::symmetric(t.space_6 as i8, t.space_4 as i8))
                     .show(ui, |ui| {
-                        let response =
-                            crate::ui_kit::shell_search_field(ui, ui.id().with("library_search"), &mut app.library.search, "Search this folder");
-                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Search documents"));
+                        let response = crate::ui_kit::shell_search_field(
+                            ui,
+                            ui.id().with("library_search"),
+                            &mut app.library.search,
+                            crate::i18n::tr("library.search_hint"),
+                        );
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, crate::i18n::tr("library.search_label")));
                     })
                     .response
                     .rect
@@ -738,7 +777,7 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
         let rect =
             egui::Rect::from_center_size(egui::pos2(ui.cursor().left() + button_size / 2.0, search.center().y), egui::vec2(button_size, button_size));
         ui.allocate_rect(rect, egui::Sense::hover());
-        let refresh = crate::ui_kit::icon_button_colored(ui, rect, "refresh", "Refresh", Some(t.text));
+        let refresh = crate::ui_kit::icon_button_colored(ui, rect, "refresh", crate::i18n::tr("library.refresh"), Some(t.text));
         crate::scenario::publish_rect("library:refresh", rect);
         ui.painter().rect_stroke(rect, t.control_radius, egui::Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
         if refresh.clicked() {
@@ -746,6 +785,7 @@ fn contents(app: &mut SolveApp, ui: &mut egui::Ui) -> Option<Entry> {
         }
     });
     ui.add_space(t.space_6);
+    app.library.update_filter();
     messages(&app.library, ui);
     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 0)).show(ui, |ui| rows(app, ui)).inner
 }
@@ -757,7 +797,7 @@ pub(super) fn app_bar_toggle(app: &mut SolveApp, ui: &mut egui::Ui, rect: egui::
     }
     let t = crate::theme::Tokens::get();
     let response = ui.interact(rect, ui.id().with("document_browser_toggle"), egui::Sense::click());
-    let label = if app.library.collapsed { "Show documents" } else { "Hide documents" };
+    let label = if app.library.collapsed { crate::i18n::tr("library.show") } else { crate::i18n::tr("library.hide") };
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     crate::scenario::publish_handle("library:toggle", rect.center());
     crate::scenario::publish_rect("library:toggle", rect);
@@ -794,6 +834,9 @@ pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
         return;
     }
     app.library.poll(ui.ctx());
+    if std::mem::take(&mut app.library.listing_changed) {
+        crate::home::refresh_document_thumbnails(&mut app.home, &app.library.listing.identities);
+    }
     if app.library.collapsed {
         actions::dialog(app, ui.ctx());
         return;
@@ -839,6 +882,36 @@ mod tests {
 
     fn folder_picker(h: &mut Harness, path: Option<String>) {
         h.app.services.pick_folder = Some(Box::new(move || Box::pin(std::future::ready(path.clone()))));
+    }
+
+    #[test]
+    fn search_cache_reuses_results_until_query_or_listing_changes() {
+        let mut state = LibraryState::default();
+        state.listing.entries =
+            (0..10_000).map(|i| Entry { path: PathBuf::from(format!("{i}.sc")), name: format!("Design {i}"), folder: false }).collect();
+        state.search = "DESIGN 123".into();
+        assert!(state.update_filter());
+        assert_eq!(state.filtered.len(), 11);
+        for _ in 0..20 {
+            assert!(!state.update_filter());
+        }
+        state.search = "absent".into();
+        assert!(state.update_filter());
+        assert!(state.filtered.is_empty());
+        state.refresh();
+        assert!(state.update_filter());
+        assert!(state.filtered.is_empty());
+    }
+
+    #[test]
+    fn folder_scan_tracks_external_replacements_without_reading_designs() {
+        let h = Harness::new();
+        let path = h.dir.join("Changed.sc");
+        std::fs::write(&path, b"old").unwrap();
+        let before = read_folder(&h.dir, &h.dir).unwrap();
+        std::fs::write(&path, b"new bytes").unwrap();
+        let after = read_folder(&h.dir, &h.dir).unwrap();
+        assert_ne!(before.identities.get(&path), after.identities.get(&path));
     }
 
     #[test]
