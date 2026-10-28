@@ -306,9 +306,10 @@ fn read_folder(root: &Path, current: &Path) -> Result<Listing, String> {
         // Do not follow symlinks or list special files. Only enumerate this directory;
         // opening a project explicitly requests its contents.
         let path = entry.path();
-        let design = path.extension().and_then(|x| x.to_str()).is_some_and(|ext| {
-            [solidcraft_engine::io::DESIGN_EXT, solidcraft_engine::io::LEGACY_DESIGN_EXT, "json"].iter().any(|known| ext.eq_ignore_ascii_case(known))
-        });
+        let design = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|ext| solidcraft_engine::io::is_design_ext(ext) || ext.eq_ignore_ascii_case("json"));
         if kind.is_dir() || (kind.is_file() && design) {
             // Read timestamps once in the background scan, never while painting cards.
             // Creation time puts externally copied designs first even when a copy preserves mtime.
@@ -1102,6 +1103,17 @@ mod tests {
         let listing = read_folder(&h.dir, &h.dir).unwrap();
         let names: Vec<_> = listing.entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["Project", "B newest.solidcraft", "Z newest.solidcraft", "A old.solidcraft"]);
+        // Track the shared current/legacy design extensions, without listing import formats.
+        for name in ["Current.SC", "Legacy.solvecraft", "Plain.json", "Import.step", "Import.iges", "Import.stl"] {
+            std::fs::write(h.dir.join(name), b"listing fixture").unwrap();
+        }
+        let listing = read_folder(&h.dir, &h.dir).unwrap();
+        for name in ["Current.SC", "Legacy.solvecraft", "Plain.json"] {
+            assert!(listing.entries.iter().any(|entry| entry.name == name), "missing {name}");
+        }
+        for name in ["Import.step", "Import.iges", "Import.stl"] {
+            assert!(!listing.entries.iter().any(|entry| entry.name == name), "import file listed: {name}");
+        }
     }
 
     #[test]

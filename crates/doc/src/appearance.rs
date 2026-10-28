@@ -161,6 +161,36 @@ pub fn material_look(material: &str) -> Option<Look> {
 }
 
 impl Document {
+    /// Resolve a picked face through the same appearance chain used by the viewport.
+    pub fn model_face_look(&self, body: &crate::ModelBody, face: usize) -> Option<Look> {
+        self.face_colors(body).into_iter().find(|(index, _)| *index == face).map(|(_, look)| look).or_else(|| self.model_display_look(body))
+    }
+
+    /// Body appearance including the imported fallback used by `body_color`.
+    pub fn model_display_look(&self, body: &crate::ModelBody) -> Option<Look> {
+        self.model_body_look(body).or_else(|| {
+            let color = body.body.color().or_else(|| body.imported.as_ref().and_then(|p| p.color))?;
+            Some(Look::custom(color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8), self.model_body_opacity(body)))
+        })
+    }
+
+    /// Distinct appearances used by an object, including its face overrides. `None` is
+    /// the unassigned/imported body appearance. Repeated faces count as one object user.
+    pub fn model_used_looks(&self, body: &crate::ModelBody) -> Vec<Option<Look>> {
+        let faces = self.face_colors(body);
+        let mut looks = Vec::new();
+        if faces.len() < body.body.face_count() || faces.is_empty() {
+            looks.push(self.model_display_look(body));
+        }
+        for (_, look) in faces {
+            let look = Some(look);
+            if !looks.contains(&look) {
+                looks.push(look);
+            }
+        }
+        looks
+    }
+
     /// Shared definition appearance for a computed occurrence body.
     pub fn model_body_look(&self, body: &crate::ModelBody) -> Option<Look> {
         let name = body.definition_name();
@@ -201,21 +231,41 @@ impl Document {
     /// The faces of a body with appearances of their own: (B-rep face index, look). A later
     /// assignment to the same face wins.
     pub fn face_colors(&self, b: &crate::ModelBody) -> Vec<(usize, Look)> {
-        // Face colours the body was imported with, under the design's own.
+        let mut out = self.imported_face_colors(b);
+        for (index, look) in self.authored_face_colors(b) {
+            out.retain(|(old, _)| *old != index);
+            out.push((index, look));
+        }
+        out
+    }
+
+    /// Imported paint alone, after applying body-appearance precedence.
+    pub(crate) fn imported_face_colors(&self, b: &crate::ModelBody) -> Vec<(usize, Look)> {
+        // An assigned body appearance replaces imported paint; design face appearances still win.
         let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let mut out: Vec<(usize, Look)> = match b.body.paint() {
-            Some(p) => p.faces.iter().map(|f| (f.face, Look::custom(f.color.map(to8), f.opacity as f64))).collect(),
-            // Carried from an earlier version of the body: by face name (worked out only here:
-            // the viewport asks every body for its face colours on every change).
-            None => match &b.imported {
-                Some(imp) => crate::naming::face_names(b)
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, n)| imp.faces.get(crate::naming::strip_piece(n)).map(|(c, o)| (i, Look::custom(c.map(to8), *o as f64))))
-                    .collect(),
-                None => Vec::new(),
-            },
-        };
+        if self.appearances.bodies.contains_key(b.definition_name()) {
+            Vec::new()
+        } else {
+            match b.body.paint() {
+                Some(p) => p.faces.iter().map(|f| (f.face, Look::custom(f.color.map(to8), f.opacity as f64))).collect(),
+                // Carried from an earlier version of the body: by face name (worked out only here:
+                // the viewport asks every body for its face colours on every change).
+                None => match &b.imported {
+                    Some(imp) => crate::naming::face_names(b)
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, n)| imp.faces.get(crate::naming::strip_piece(n)).map(|(c, o)| (i, Look::custom(c.map(to8), *o as f64))))
+                        .collect(),
+                    None => Vec::new(),
+                },
+            }
+        }
+    }
+
+    /// Design-authored face overrides, without imported STEP paint. Linked designs carry
+    /// these independently so an inherited body look does not hide their face overrides.
+    pub fn authored_face_colors(&self, b: &crate::ModelBody) -> Vec<(usize, Look)> {
+        let mut out = Vec::new();
         for f in self.appearances.faces.iter().filter(|f| f.body == b.definition_name()) {
             let (p, look) = (crate::apply_point(&b.source_transform, f.point), f.look.clone());
             if f.strict_name {
@@ -337,6 +387,85 @@ mod tests {
         let mut mixed = painted.clone();
         mixed.materials.insert("Body1".into(), "Steel".into());
         assert!(!mixed.differs_only_in_appearance(&before), "a material change is not appearance-only");
+    }
+
+    fn imported_box() -> crate::ModelBody {
+        let body = solidcraft_kernel::box_solid(Vec3::ZERO, Vec3::new(10., 10., 10.)).unwrap();
+        let faces = body
+            .faces(0.01)
+            .unwrap()
+            .iter()
+            .map(|face| solidcraft_kernel::FacePaint { face: face.index, color: [1., 0., 0.], opacity: 0.5 })
+            .collect();
+        crate::ModelBody::new("Imported".into(), body.with_paint(Some(solidcraft_kernel::Paint { opacity: 1., faces })), 1)
+    }
+
+    fn check_imported_appearance_precedence(body: &crate::ModelBody) {
+        let mut doc = Document::default();
+        let face_count = body.body.faces(0.01).unwrap().len();
+        let imported = doc.face_colors(body);
+        assert_eq!(imported.len(), face_count);
+        assert!(imported.iter().all(|(_, look)| *look == Look::custom([255, 0, 0], 0.5)));
+
+        let body_look = Look::custom([0, 0, 255], 0.8);
+        doc.appearances.bodies.insert(body.definition_name().into(), body_look.clone());
+        assert_eq!(doc.model_body_look(body), Some(body_look.clone()));
+        assert_eq!(doc.model_body_opacity(body), body_look.opacity);
+        assert!(doc.face_colors(body).is_empty(), "all faces must inherit the assigned body appearance");
+
+        let face_look = Look::custom([0, 255, 0], 1.);
+        let name = crate::naming::face_names(body)[0].clone();
+        doc.appearances.faces.push(FaceLook {
+            body: body.definition_name().into(),
+            point: Vec3::ZERO,
+            look: face_look.clone(),
+            name: Some(name),
+            strict_name: false,
+            certificate: None,
+        });
+        assert_eq!(doc.face_colors(body), vec![(0, face_look.clone())]);
+
+        doc.appearances.bodies.clear();
+        let restored = doc.face_colors(body);
+        assert_eq!(restored.len(), face_count);
+        assert!(restored.iter().all(|(face, look)| *look == if *face == 0 { face_look.clone() } else { Look::custom([255, 0, 0], 0.5) }));
+    }
+
+    #[test]
+    fn linked_paint_retains_imported_faces_without_baking_authored_overrides() {
+        let mut state = crate::ModelState::default();
+        state.bodies.push(imported_box());
+        let body = &state.bodies[0];
+        let mut doc = Document::default();
+        doc.appearances.faces.push(FaceLook {
+            body: body.name.clone(),
+            point: Vec3::ZERO,
+            look: Look::custom([0, 255, 0], 1.0),
+            name: Some(crate::naming::face_names(body)[0].clone()),
+            strict_name: false,
+            certificate: None,
+        });
+        let exported = doc.painted(&state);
+        assert!(exported.bodies[0].body.paint().unwrap().faces.iter().any(|face| face.color == [0., 1., 0.]));
+        let linked = doc.painted_for_link(&state);
+        let faces = &linked.bodies[0].body.paint().unwrap().faces;
+        assert_eq!(faces.len(), body.body.faces(0.01).unwrap().len());
+        assert!(faces.iter().all(|face| face.color == [1., 0., 0.] && face.opacity == 0.5));
+    }
+
+    #[test]
+    fn body_appearance_overrides_imported_face_paint() {
+        check_imported_appearance_precedence(&imported_box());
+    }
+
+    #[test]
+    fn body_appearance_overrides_carried_imported_face_paint() {
+        let mut body = imported_box();
+        body.imported = ImportedLook::of(&body);
+        body.body = body.body.clone().with_paint(None);
+        body.source_name = Some(body.name.clone());
+        body.name = "Occurrence".into();
+        check_imported_appearance_precedence(&body);
     }
 
     #[test]

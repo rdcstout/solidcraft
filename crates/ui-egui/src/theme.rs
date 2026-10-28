@@ -285,7 +285,7 @@ impl TabAccent {
             "MESH" => (t.mesh_fill, t.mesh_ink, t.mesh_soft),
             "FORM" => (t.form_fill, t.form_tab_ink, t.form_soft),
             "SHEET METAL" => (t.sheet_fill, t.sheet_ink, t.sheet_soft),
-            "RENDER" => (t.render_fill, t.render_ink, t.render_soft),
+            "RENDER" | "RENDER APPEARANCE" | "RENDER SCENE" | "RENDER CAMERA" => (t.render_fill, t.render_ink, t.render_soft),
             // Model and shared utility tabs retain their existing selection exactly.
             _ => (t.accent, t.selected_ink, t.accent_soft),
         };
@@ -512,6 +512,16 @@ pub struct IconColors {
 pub struct Tokens {
     /// User-assigned document labels: red, orange, green, blue, purple.
     pub library_highlights: [Color32; 5],
+    /// Navigation chrome from the approved Navbar boards.
+    pub nav_hover: Color32,
+    pub nav_press: Color32,
+    pub nav_dim: Color32,
+    pub nav_viewport: Color32,
+    pub nav_tip: Color32,
+    pub nav_tip_ink: Color32,
+    pub nav_tip_key_border: Color32,
+    pub nav_field: Color32,
+
     /// Optional structural/control strokes. None retains each surface’s legacy styling.
     pub borders: Borders,
     /// File/start presentation, with explicit foreground/background pairs.
@@ -589,6 +599,8 @@ pub struct Tokens {
     pub form_ink: Color32,
     pub form_dim: Color32,
     pub form_primary: Color32,
+    /// Primary action fill; theme files without this token inherit `form_primary`.
+    pub form_primary_fill: Color32,
     pub form_error: Color32,
     pub form_error_fill: Color32,
     /// Successful validation text and its badge surface.

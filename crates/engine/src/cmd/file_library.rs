@@ -163,7 +163,7 @@ mod tests {
         let original = f.design("Part.solidcraft");
         let assembly = f.0.join("Assembly.solidcraft");
         let mut doc = solidcraft_doc::Document::new("Assembly");
-        doc.links.insert(1, solidcraft_doc::DesignLink { path: "Part.solidcraft".into(), feature: 1 });
+        doc.links.insert(1, solidcraft_doc::DesignLink { path: "Part.solidcraft".into(), feature: 1, ..Default::default() });
         std::fs::write(&assembly, solidcraft_io::write_design(&doc)).unwrap();
         let mut s = session();
         s.path = Some(original.to_string_lossy().into_owned());
