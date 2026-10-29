@@ -32,14 +32,23 @@ pub(crate) struct Row<'a> {
     pub(crate) selected: bool,
     pub(crate) dim: bool,
     pub(crate) color: Option<Color32>,
+    /// Draw the icon in this one colour instead of its artwork (a sketch's solve state, #7245).
+    pub(crate) icon_ink: Option<Color32>,
+    /// The row's tooltip (a sketch's solve state), after its full name when that is cut short.
+    pub(crate) tip: Option<&'a str>,
     /// Component rows: is it the active one?
     pub(crate) radio: Option<bool>,
     /// Trailing badges: "lock", "pin".
     pub(crate) badges: &'a [&'a str],
     /// A button right after the name: (icon, tooltip label), e.g. a feature's profile sketch.
     pub(crate) action: Option<(&'a str, &'a str)>,
+    /// A message id the row's tooltip names it by (a body row: mesh, surface or solid body).
+    pub(crate) kind_tip: Option<&'a str>,
     /// Lit by the selection or the 3D view's pointer: the item's own row, or a row leading to it.
     pub(crate) mark: Mark,
+    /// A feature that failed or built with a warning, or a folded row holding one: its mark at
+    /// the row's end, the message in [`Row::tip`].
+    pub(crate) status: Option<Status>,
     /// Optional document appearance and shared trailing text slots.
     pub(crate) swatch: Option<Color32>,
     pub(crate) secondary: &'a str,
@@ -61,6 +70,23 @@ pub(crate) enum Mark {
     Here,
 }
 
+/// A feature's build state as its row marks it; the worse one sorts last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Status {
+    Warning,
+    Error,
+}
+
+impl Status {
+    /// The icon and the scenario handle's word.
+    pub(crate) fn icon(self) -> &'static str {
+        match self {
+            Status::Warning => "warning",
+            Status::Error => "error",
+        }
+    }
+}
+
 /// What happened on a row.
 #[derive(Default)]
 pub(crate) struct RowResp {
@@ -70,6 +96,7 @@ pub(crate) struct RowResp {
     pub(crate) secondary: Option<Pos2>,
     pub(crate) fold: bool,
     pub(crate) eye: bool,
+    pub(crate) eye_rect: Option<Rect>,
     pub(crate) radio: bool,
     /// The row's [`Row::action`] button was clicked.
     pub(crate) action: bool,
@@ -194,6 +221,7 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         // Hidden or faded rows keep main's dimming, with the rounded suppression asset.
         icons::paint_icon(ui.painter(), er, if vis { "eye" } else { "suppress" }, if vis && !row.dim { 0.85 } else { DIM_ICON_OPACITY });
         out.eye = resp.clicked() && click_on == 2;
+        out.eye_rect = Some(eye_r.intersect(ui.clip_rect()));
         crate::scenario::publish_handle(&format!("eye:{}", row.label), er.center());
     }
     if !row.compact {
@@ -213,7 +241,11 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         let ir = Rect::from_min_size(pos2(x, cy - 8.0), vec2(t.space_16, t.space_16));
         // Icons are full-colour images (a tint colour only sets their opacity): a hidden or
         // faded row draws its icon faint, like its label.
-        icons::paint_icon(ui.painter(), ir, row.icon, if row.dim { DIM_ICON_OPACITY } else { 1.0 });
+        let opacity = if row.dim { DIM_ICON_OPACITY } else { 1.0 };
+        match row.icon_ink {
+            Some(ink) => icons::paint_ink(ui.painter(), ir, row.icon, ink.gamma_multiply(opacity)),
+            None => icons::paint_icon(ui.painter(), ir, row.icon, opacity),
+        }
         x += 21.0;
     }
     if let Some(color) = row.swatch {
@@ -235,6 +267,13 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     // and its full text is in the tooltip.
     let badges_width = row.badges.len() as f32 * 15.0;
     let mut right = if row.compact && row.eye.is_some() { eye_r.left() - t.space_4 } else { action_left } - badges_width;
+    if let Some(status) = row.status {
+        right -= t.space_16;
+        let sr = Rect::from_center_size(pos2(right + t.space_8, cy), vec2(t.space_14, t.space_14));
+        icons::paint_icon(ui.painter(), sr, status.icon(), 1.0);
+        crate::scenario::publish_handle(&format!("status:{}:{}", status.icon(), row.label), sr.center());
+        right -= t.space_4;
+    }
     for text in [row.count, row.secondary, if row.compact { row.subtitle } else { "" }] {
         if text.is_empty() {
             continue;
@@ -298,13 +337,16 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         3 => Some(if row.radio == Some(true) { crate::i18n::tr("ui.active_component") } else { crate::i18n::tr("ui.activate") }),
         _ => None,
     };
-    let resp = match tip {
-        Some(t) => resp.on_hover_text(t),
-        None if !row.secondary.is_empty() || !row.count.is_empty() => {
+    let state = row.kind_tip.map(crate::i18n::tr).or(row.tip);
+    let resp = match (tip, state) {
+        (Some(t), _) => resp.on_hover_text(t),
+        (None, Some(state)) if elided => resp.on_hover_text(format!("{label_display}\n{state}")),
+        (None, Some(state)) => resp.on_hover_text(state),
+        (None, None) if !row.secondary.is_empty() || !row.count.is_empty() => {
             resp.on_hover_text(format!("{label_display}\n{}\n{}", row.secondary, row.count))
         }
-        None if elided => resp.on_hover_text(label_display.to_string()),
-        None => resp,
+        (None, None) if elided => resp.on_hover_text(label_display.to_string()),
+        (None, None) => resp,
     };
     out.on_control = press_on != 0 || over_action(ui.input(|i| i.pointer.press_origin()));
     out.clicked = resp.clicked() && click_on == 0 && !action_click;

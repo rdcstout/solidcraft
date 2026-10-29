@@ -13,7 +13,10 @@ fn measure_input_fits_external_sketch_geometry() {
     assert!(fits(accept, &curve));
     assert!(fits(accept, &point));
     assert_eq!(d.items(), vec![curve.clone(), point.clone()]);
-    assert_eq!(d.candidate(&h.app.session, &Hit::SketchCurve { sketch: 17, id: "line1".into(), straight: true }), Some(curve.clone()));
+    assert_eq!(
+        d.candidate(&h.app.session, &Hit::SketchCurve { sketch: 17, id: "line1".into(), straight: true, point: solidcraft_engine::geom::Vec3::ZERO }),
+        Some(curve.clone())
+    );
     assert_eq!(
         d.candidate(&h.app.session, &Hit::SketchPoint { sketch: 17, id: "p1".into(), at: solidcraft_engine::geom::Vec2::new(0.0, 0.0) }),
         Some(point.clone())
@@ -395,7 +398,53 @@ form_case!(web, "solid.web", ["Direction", "Thickness", "Depth"]);
 form_case!(emboss, "solid.emboss", ["Depth", "Type"]);
 form_case!(replace_face, "solid.replace_face", []);
 form_case!(boundary_fill, "solid.boundary_fill", ["Cells", "Operation"]);
-form_case!(align, "solid.align", ["From Snap", "To Snap"]);
+form_case!(align, "solid.align", ["Object Type", "From Snap", "To Snap"]);
+
+#[test]
+fn align_components_mode_switches_and_aligns_only_selected_instance() {
+    let mut h = Harness::new();
+    let comp = h.app.run("component.create", json!({"name": "Extrusion"})).unwrap()["component"].as_u64().unwrap();
+    h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 60, "body_name": "Beam"})).unwrap();
+    h.app.run("component.activate", json!({"component": "root"})).unwrap();
+    let second = h.app.run("occurrence.copy", json!({"component": comp, "translate": [40, 0, 0]})).unwrap()["occurrence"].as_u64().unwrap();
+
+    // Preselecting an occurrence opens Align in Components mode and advances to From.
+    let picked = vec![Sel::Occurrence { path: vec![second] }];
+    h.app.session.selection = picked.clone();
+    h.app.start("solid.align");
+    h.frames(4);
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].label, "Components");
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, picked);
+    assert_eq!(h.app.dialog.as_ref().unwrap().active, 1);
+
+    // Switching Object Type to Bodies and back restores the preselected occurrence.
+    mirror_object_type(&mut h, "Bodies");
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].label, "Bodies");
+    assert!(h.app.dialog.as_ref().unwrap().inputs[0].items.is_empty());
+    mirror_object_type(&mut h, "Components");
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].label, "Components");
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, picked);
+
+    let from = face_sel(&h.app.session, Vec3::new(45.0, 5.0, 0.0)).unwrap();
+    let to = face_sel(&h.app.session, Vec3::new(10.0, 5.0, 30.0)).unwrap();
+    {
+        let d = h.app.dialog.as_mut().unwrap();
+        d.inputs[1].items = vec![from];
+        d.inputs[2].items = vec![to];
+    }
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands[0].0, "occurrence.align");
+    assert_eq!(commands[0].1["paths"], json!([[second]]));
+    for (command, params) in commands {
+        h.app.run(&command, params).unwrap();
+    }
+
+    let st = h.app.session.world_state();
+    let b1 = st.body("Beam").unwrap().mesh().bounds();
+    assert!((b1.min.x - 0.0).abs() < 1e-5 && (b1.max.x - 10.0).abs() < 1e-5, "{b1:?}");
+    let b2 = st.body("Beam (Extrusion:2)").unwrap().mesh().bounds();
+    assert!((b2.min.x - 10.0).abs() < 1e-5 && (b2.max.x - 70.0).abs() < 1e-5, "{b2:?}");
+}
 form_case!(remove, "solid.remove", []);
 form_case!(path_pattern, "solid.pattern.path", ["Type", "Object Type", "Quantity", "Spacing"]);
 form_case!(pipe, "solid.pipe", ["Diameter", "Wall", "Operation"]);
@@ -943,6 +992,33 @@ fn viewport_profile_click_returns_extrude_value_focus() {
     assert!((bounds.max.z - bounds.min.z - 30.0).abs() < 1e-7);
 }
 
+/// Typing `depth = 30` in the extrude dialog's distance defines the user parameter `depth` and
+/// the extrude uses it, in the dialog's one undo step; the preview made nothing (#4071).
+#[test]
+fn a_dialog_field_typed_as_a_definition_defines_the_parameter() {
+    let mut h = extrude_focus_fixture();
+    let undo = h.app.session.undo.len();
+    // As above: the first click returns focus to the distance, the second picks the profile.
+    h.step(&json!({"click":{"world":[15,10,0]}})).unwrap();
+    h.step(&json!({"text":"30"})).unwrap();
+    h.step(&json!({"click":{"world":[15,10,0]}})).unwrap();
+    h.step(&json!({"text":"depth = 30"})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Extrude { distance, .. } if distance == "depth = 30"));
+    h.settle();
+    assert!(h.app.session.doc.param("depth").is_none(), "the preview defined nothing");
+    h.step(&json!({"key":"Enter"})).unwrap();
+    h.settle();
+    assert!(h.app.dialog.is_none(), "{:?} {:?}", h.app.status, h.app.dialog.as_ref().map(|d| (d.error.clone(), format!("{:?}", d.kind))));
+    let doc = &h.app.session.doc;
+    let depth = doc.param("depth").expect("the user parameter was added");
+    assert!(!depth.model && depth.expr == "30" && depth.unit == "mm", "{depth:?}");
+    let extrude = doc.features.iter().rev().find(|f| f.name.starts_with("Extrude")).unwrap();
+    assert!(extrude.kind.inputs().iter().any(|(label, e, _)| *label == "Distance" && e == "depth"), "{:?}", extrude.kind.inputs());
+    assert_eq!(h.app.session.undo.len(), undo + 1, "one undo step");
+    let bounds = h.app.session.world_state().bodies.first().unwrap().mesh().bounds();
+    assert!((bounds.max.z - bounds.min.z - 30.0).abs() < 1e-7);
+}
+
 #[test]
 fn viewport_empty_click_falls_back_to_first_numeric_dialog_field() {
     let mut h = extrude_focus_fixture();
@@ -1030,4 +1106,36 @@ fn every_selection_field_label_is_translated() {
         }
     }
     assert!(missing.is_empty(), "selection fields without a message: {missing:#?}");
+}
+
+#[test]
+fn align_components_picks_the_placement_under_the_active_component_and_warns_when_shared() {
+    let mut h = Harness::new();
+    let made = h.app.run("component.create", json!({"name": "Frame", "grounded": false})).unwrap();
+    let (frame, a) = (made["component"].as_u64().unwrap(), made["occurrence"].as_u64().unwrap());
+    let bracket = h.app.run("component.create", json!({"name": "Bracket", "grounded": false})).unwrap()["occurrence"].as_u64().unwrap();
+    h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 4, "body_name": "Plate"})).unwrap();
+    h.app.run("component.activate", json!({"component": "root"})).unwrap();
+    let plate = h.app.session.world_state().bodies.first().map(|b| b.name.clone()).unwrap();
+
+    // With the design active, a click on the part inside Frame picks the Frame placement.
+    assert_eq!(occurrence_path_of_body(&h.app.session, &plate), Some(vec![a]));
+    // With that Frame placement active, the same click picks the part inside it.
+    h.app.run("component.activate", json!({"component": frame, "occurrence": a, "path": [a]})).unwrap();
+    assert_eq!(occurrence_path_of_body(&h.app.session, &plate), Some(vec![a, bracket]));
+    assert!(!align_moves_shared(&h.app.session, &[Sel::Occurrence { path: vec![a, bracket] }]), "Frame is placed once");
+
+    // Once Frame is placed twice, the part's placement inside it is shared: the dialog says so.
+    h.app.run("component.activate", json!({"component": "root"})).unwrap();
+    h.app.run("occurrence.copy", json!({"component": frame, "translate": [0, 50, 0]})).unwrap();
+    assert!(align_moves_shared(&h.app.session, &[Sel::Occurrence { path: vec![a, bracket] }]));
+    assert!(!align_moves_shared(&h.app.session, &[Sel::Occurrence { path: vec![a] }]), "a top-level placement is its own");
+
+    h.app.session.selection = vec![Sel::Occurrence { path: vec![a] }];
+    h.app.start("solid.align");
+    h.frames(4);
+    assert!(h.widget(ALIGN_SHARED_WARNING).is_none(), "no warning for a top-level pick");
+    h.app.dialog.as_mut().unwrap().inputs[0].items = vec![Sel::Occurrence { path: vec![a, bracket] }];
+    h.frames(4);
+    assert!(h.widget(ALIGN_SHARED_WARNING).is_some(), "the shared pick is called out");
 }

@@ -358,6 +358,28 @@ fn profile_with_arcs_and_construction_ignored() {
 }
 
 #[test]
+fn profiles_join_unconstrained_nearby_line_arc_endpoints() {
+    let mut sk = Sketch::new();
+    let bottom_left = sk.add_point(v(0.0, 0.0), None).unwrap();
+    let bottom_right = sk.add_point(v(20.0, 0.0), None).unwrap();
+    let arc_start = sk.add_point(v(20.00004, 5.0 - (25.0_f64 - 0.00004_f64.powi(2)).sqrt()), None).unwrap();
+    let center = sk.add_point(v(20.0, 5.0), None).unwrap();
+    let top_right = sk.add_point(v(20.0, 10.0), None).unwrap();
+    let top_left = sk.add_point(v(0.0, 10.0), None).unwrap();
+    let left_center = sk.add_point(v(0.0, 5.0), None).unwrap();
+
+    sk.add_line_pts(bottom_left, bottom_right, None).unwrap();
+    sk.add_arc(v(20.0, 5.0), sk.points[arc_start].pos, v(20.0, 10.0), [Some(center), Some(arc_start), Some(top_right)], None).unwrap();
+    sk.add_line_pts(top_right, top_left, None).unwrap();
+    sk.add_arc(v(0.0, 5.0), v(0.0, 10.0), v(0.0, 0.0), [Some(left_center), Some(top_left), Some(bottom_left)], None).unwrap();
+
+    let profiles = find_profiles(&sk);
+    assert_eq!(profiles.len(), 1, "{profiles:?}");
+    assert!(profiles[0].region.outer.is_closed(1e-6), "{:?}", profiles[0].region.outer.segs);
+    assert!((profiles[0].area - (200.0 + PI * 25.0)).abs() < 1e-6, "{}", profiles[0].area);
+}
+
+#[test]
 fn removal_and_references() {
     let mut sk = Sketch::new();
     let l1 = sk.add_line(v(0.0, 0.0), v(1.0, 0.0), None, None, Some("l1")).unwrap();
@@ -809,17 +831,19 @@ fn text_beside_other_curves_is_drawn_geometry() {
     }
     assert_areas(&sorted_areas(&find_drawn_profiles(&sk)), vec![13.5557, 600.0]);
     // Projected reference geometry still doesn't count as drawn.
-    let square = |s: f64| {
+    let square = |x: f64, s: f64| {
         vec![
-            LinkGeom::Line(v(100.0, 0.0), v(100.0 + s, 0.0)),
-            LinkGeom::Line(v(100.0 + s, 0.0), v(100.0 + s, s)),
-            LinkGeom::Line(v(100.0 + s, s), v(100.0, s)),
-            LinkGeom::Line(v(100.0, s), v(100.0, 0.0)),
+            LinkGeom::Line(v(x, 0.0), v(x + s, 0.0)),
+            LinkGeom::Line(v(x + s, 0.0), v(x + s, s)),
+            LinkGeom::Line(v(x + s, s), v(x, s)),
+            LinkGeom::Line(v(x, s), v(x, 0.0)),
         ]
     };
-    sk.add_link(LinkKind::Project, LinkSource::Origin, &square(5.0)).unwrap();
+    sk.add_link(LinkKind::Project, LinkSource::Origin, &square(100.0, 5.0)).unwrap();
     assert_eq!(find_profiles(&sk).len(), 3);
     assert_areas(&sorted_areas(&find_drawn_profiles(&sk)), vec![13.5557, 600.0]);
+    sk.add_link(LinkKind::Intersect, LinkSource::Origin, &square(110.0, 7.0)).unwrap();
+    assert_areas(&sorted_areas(&find_drawn_profiles(&sk)), vec![13.5557, 49.0, 600.0]);
 }
 
 #[test]

@@ -111,6 +111,10 @@ const BUTTON_GAP: f32 = 3.0;
 const BUTTON_MIN_WIDTH: f32 = 54.0;
 const BUTTON_MAX_WIDTH: f32 = 76.0;
 const BUTTON_LABEL_PADDING: f32 = 10.0;
+/// Where a button's label starts below the button's top edge, under its icon.
+const BUTTON_LABEL_TOP: f32 = 32.0;
+/// Room kept below a button's label, inside its highlight.
+const BUTTON_LABEL_BOTTOM: f32 = 2.0;
 const SECTION_HEIGHT: f32 = 20.0;
 
 /// The » button's room at the end of the panels, kept only while some panel is in it.
@@ -669,6 +673,10 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
                     FileAction::Command("file.insert_mesh").run(app);
                     close = true;
                 }
+                if item_if(ui, &format!("{}…", app.tr_label("Insert Point Cloud")), "", "import", shown) {
+                    app.start("pointcloud.insert");
+                    close = true;
+                }
                 if item_if(ui, &format!("{}…", app.tr_label("Insert Design")), "", "component", shown) {
                     FileAction::Command("component.insert_design").run(app);
                     close = true;
@@ -793,12 +801,13 @@ pub(crate) fn save_as(app: &mut SolveApp) {
 
 /// Save As offering a copy's name ("Bracket copy"), so the file it is a copy of is kept.
 pub(crate) fn save_copy(app: &mut SolveApp) {
-    let name = crate::i18n::format("document.copy_name", &[("name", &app.session.doc.name)]);
+    let name = crate::i18n::format("document.copy_name", &[("name", &app.session.save_as_name())]);
     save_as_named(app, &name, solidcraft_engine::io::DESIGN_EXT);
 }
 
+/// Save As offers the open file's own name, not the name stored in the design (#8329).
 fn save_as_with_extension(app: &mut SolveApp, extension: &str) {
-    let name = app.session.doc.name.clone();
+    let name = app.session.save_as_name();
     save_as_named(app, &name, extension);
 }
 
@@ -984,13 +993,27 @@ fn ribbon_label_lines(painter: &egui::Painter, label: &str, width: f32) -> Vec<S
 fn ribbon_button_galley(painter: &egui::Painter, label: &str, width: f32, color: Color32) -> std::sync::Arc<egui::Galley> {
     let lines = ribbon_button_lines(painter, label, width);
     // Explicit newlines only: egui must never split an oversized word.
-    let mut job = egui::text::LayoutJob::simple(lines.join("\n"), FontId::proportional(crate::theme::Tokens::get().font_body), color, f32::INFINITY);
+    let size = crate::theme::Tokens::get().font_body;
+    let mut job = egui::text::LayoutJob::simple(lines.join("\n"), FontId::proportional(size), color, f32::INFINITY);
     job.halign = egui::Align::Center;
+    // Two lines sit closer than the font's own spacing, so they fit in the button under its
+    // icon (#8391).
+    if lines.len() > 1
+        && let Some(section) = job.sections.first_mut()
+    {
+        section.format.line_height = Some(size + 2.0);
+    }
     painter.layout_job(job)
 }
 
+/// The top of a button's label, `height` tall, in the button `whole`: below the icon, raised
+/// when it would otherwise run past the button's bottom edge (#8391).
+fn ribbon_label_top(whole: Rect, height: f32) -> f32 {
+    (whole.top() + BUTTON_LABEL_TOP).min(whole.bottom() - BUTTON_LABEL_BOTTOM - height)
+}
+
 /// Ribbon headings use the translated labels, with normal word casing instead of registry caps.
-fn ribbon_label(app: &SolveApp, label: &str) -> String {
+pub(crate) fn ribbon_label(app: &SolveApp, label: &str) -> String {
     let label = crate::workspace::word_cased(app.tr_label(crate::workspace::tab_label(label)));
     // Partial catalogs may already translate the word-cased name (for example "Model").
     app.tr_label(&label).to_string()
@@ -1053,9 +1076,15 @@ fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
                 + 24.0
         })
         .collect();
+    // A plus after the last tab opens the toolbar's menu, so tabs can be shown or hidden without
+    // knowing about the right-click; it stays when every tab is hidden. The Render workspace's
+    // one tab can't be hidden.
+    let add = !crate::render_workspace::active(app);
+    let add_size = TAB_ROW_HEIGHT - 2.0 * RIBBON_TAB_INSET;
     let tabs_width: f32 = widths.iter().sum::<f32>()
         + tabs.len().saturating_sub(1) as f32 * 2.0
-        + tabs.iter().filter(|tab| contextual_tab(app, tab)).count() as f32 * 6.0;
+        + tabs.iter().filter(|tab| contextual_tab(app, tab)).count() as f32 * 6.0
+        + if add { 2.0 + add_size } else { 0.0 };
     let search_width = crate::ui_kit::CommandSearch::closed_width(ui.ctx());
     // The first tab and the search field sit the same distance from the card's top, left and right
     // edges, so their outer corners are concentric with the card's corners.
@@ -1140,7 +1169,31 @@ fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
                     if response.clicked() {
                         app.ui.tab = tab.to_string();
                     }
+                    if response.secondary_clicked() {
+                        crate::context_menu::open_for(
+                            app,
+                            response.interact_pointer_pos().unwrap_or(tr.left_bottom()),
+                            crate::context_menu::Target::Toolbar,
+                        );
+                    }
                     x += width + 2.0;
+                }
+                if add {
+                    let pr = Rect::from_min_size(pos2(x, all.top() + inset), vec2(add_size, add_size));
+                    let open = crate::context_menu::open_from(app, pr, &crate::context_menu::Target::Toolbar);
+                    if open && !ui.rect_contains_pointer(pr) {
+                        ui.painter().rect_filled(pr, t.control_radius, t.hover);
+                    }
+                    let response = crate::ui_kit::quiet_icon_button_at(ui, pr, "plus", app.tr("prefs.toolbar_tabs"));
+                    if ui.clip_rect().contains(pr.center()) {
+                        crate::scenario::publish_target("ribbon:add_tab", pr);
+                    }
+                    if response.clicked() {
+                        // A click leaves no keyboard focus here, as on the tabs, so single-key
+                        // shortcuts such as S still work afterwards.
+                        response.surrender_focus();
+                        crate::context_menu::toggle_for(app, pr, pr.left_bottom(), crate::context_menu::Target::Toolbar);
+                    }
                 }
             });
     });
@@ -1345,6 +1398,12 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             })
             .collect();
         let right = r.right();
+        if crate::workspace::visible_tabs(app).is_empty() {
+            // Every tab is hidden: the ribbon says how to bring them back.
+            let at = pos2((ribbon_left + right) / 2.0, top + group_height / 2.0);
+            ribbon_text(ui, at, app.tr("ui.toolbar_tabs_hidden"), t.font_body, t.text_dim, false);
+            crate::scenario::publish_handle("ribbon:tabs_hidden", at);
+        }
         // The Sketch exit group follows the last sketch panel, and is always kept room for so it
         // stays reachable at every width; when panels go into the » menu it moves to the far right.
         let finish_plan =
@@ -1509,14 +1568,15 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                     Container::new(ui.ctx(), Surface::Popup).menu(&arrow).show(|ui| {
                         let variants: Vec<_> = f.commands.iter().filter_map(|id| solidcraft_engine::find_command(id)).collect();
                         dropdown_keys(app, ui, &variants);
-                        sketch_menu_rows(app, ui, &variants, &mut menu, &mut toggle);
+                        let width = dropdown_width(app, ui, &variants);
+                        sketch_menu_rows(app, ui, &variants, width, &mut menu, &mut toggle);
                     });
                 } else if labels {
                     let button_label = crate::workspace::ribbon_button_label(selected);
                     let label = app.tr_label(if button_label == selected.label { info.label } else { button_label });
                     let color = if info.enabled { t.text } else { t.text_dim };
                     let galley = ribbon_button_galley(&painter, label, whole.width() - BUTTON_LABEL_PADDING, color);
-                    painter.galley(pos2(whole.center().x, whole.top() + 32.0), galley, t.text);
+                    painter.galley(pos2(whole.center().x, ribbon_label_top(whole, galley.size().y)), galley, t.text);
                 }
             }
             if !collapsed && drawn > large.len() {
@@ -1557,13 +1617,13 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                     icons::paint_icon(
                         &painter,
                         Rect::from_center_size(cell.center(), vec2(15.0, 15.0)),
-                        c.icon,
+                        info.icon,
                         if info.enabled { 1.0 } else { 0.35 },
                     );
                     for prefix in ["toolbar", "button", "ribbon:constraint"] {
                         crate::scenario::publish_target(&format!("{prefix}:{}", c.id), cell);
                     }
-                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, info.enabled, app.tr_label(c.label)));
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, info.enabled, app.tr_label(info.label)));
                     if resp.drag_started() {
                         resp.dnd_set_drag_payload(ToolbarDrag { id: c.id, from_menu: false });
                     }
@@ -1654,7 +1714,10 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                                 ui.label(egui::RichText::new(crate::i18n::tr_label("Not available yet")).color(t.text_dim));
                             }
                             if sketch_create {
-                                sketch_create_menu(app, ui, &cmds, &mut menu, &mut toggle);
+                                // One width for every row and the footer, as in the other panels.
+                                let row_w = dropdown_width(app, ui, &cmds);
+                                ui.set_width(row_w);
+                                sketch_create_menu(app, ui, &cmds, row_w, &mut menu, &mut toggle);
                                 section_footer(ui);
                                 return;
                             }
@@ -1727,7 +1790,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                     for (panel, cmds) in &overflow {
                         crate::ui_kit::Menu::button(ui, *panel, |ui| {
                             if tab == "SKETCH" && *panel == "CREATE" {
-                                sketch_create_menu(app, ui, cmds, &mut menu, &mut toggle);
+                                sketch_create_menu(app, ui, cmds, dropdown_width(app, ui, cmds), &mut menu, &mut toggle);
                                 return;
                             }
                             if *panel == "SELECT" {
@@ -1842,7 +1905,7 @@ const CONSTRAINT_GRID_WIDTH: f32 = 82.0;
 fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft_engine::CommandSpec, disabled: Option<&str>) -> egui::Response {
     response.on_hover_ui(|ui| {
         let t = Tokens::get();
-        let name = app.tr_label(command.info(&app.session).label);
+        let name = app.tr_label(crate::render_workspace::interactive_command_info(app, command).label);
         let name_width =
             ui.painter().layout_no_wrap(name.to_string(), crate::fonts::semibold(crate::theme::Tokens::get().font_heading), t.text).size().x;
         let key_width = crate::keymap::display_for(app, command.id)
@@ -2003,10 +2066,12 @@ fn dropdown_row(app: &SolveApp, ui: &mut egui::Ui, c: &'static solidcraft_engine
 }
 
 /// Creation menus keep related variants together, including collapsed and overflow panels.
+/// The plain rows are `width` wide, the width the menu gives its family rows.
 fn sketch_create_menu(
     app: &mut SolveApp,
     ui: &mut egui::Ui,
     cmds: &[&'static solidcraft_engine::CommandSpec],
+    width: f32,
     menu: &mut Option<(egui::Pos2, &'static str)>,
     toggle: &mut Option<&'static str>,
 ) {
@@ -2020,7 +2085,8 @@ fn sketch_create_menu(
                 item.submenu = true;
                 let response = crate::ui_kit::Menu::item_button(ui, &item, |ui| {
                     dropdown_keys(app, ui, &variants);
-                    sketch_menu_rows(app, ui, &variants, menu, toggle);
+                    let variants_w = dropdown_width(app, ui, &variants);
+                    sketch_menu_rows(app, ui, &variants, variants_w, menu, toggle);
                 });
                 crate::scenario::publish_handle(&format!("create_family:{}", f.label), response.response.rect.center());
             }
@@ -2028,7 +2094,7 @@ fn sketch_create_menu(
         ui.separator();
         let rest: Vec<_> = cmds.iter().copied().filter(|c| crate::sketch_families::family(c.id).is_none()).collect();
         dropdown_keys(app, ui, &rest);
-        sketch_menu_rows(app, ui, &rest, menu, toggle);
+        sketch_menu_rows(app, ui, &rest, width, menu, toggle);
     });
 }
 
@@ -2071,10 +2137,10 @@ fn sketch_menu_rows(
     app: &mut SolveApp,
     ui: &mut egui::Ui,
     cmds: &[&'static solidcraft_engine::CommandSpec],
+    width: f32,
     menu: &mut Option<(egui::Pos2, &'static str)>,
     toggle: &mut Option<&'static str>,
 ) {
-    let width = dropdown_width(app, ui, cmds);
     for c in cmds {
         let pinned = crate::toolbar_custom::pinned_on(app, "SKETCH", c.id).is_some();
         match dropdown_row(app, ui, c, width, pinned) {
@@ -2226,6 +2292,9 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                     });
                 }
                 _ if !shown => {}
+                // Close the design shown (asking first when it is unsaved); closing the last one
+                // shows the start page (#5366).
+                Key::W if !mods.shift && !mods.alt => crate::documents::close(app, app.docs.active, false),
                 Key::Z => {
                     if !crate::tools::undo_spline_point(app) {
                         drop(app.run("edit.undo", json!({})));
@@ -2248,9 +2317,17 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
         match k {
             Key::Escape => {
                 app.esc_handled = true;
+                if crate::render_workspace::result_active(app) {
+                    crate::keymap::press(app, "Escape", repeat);
+                    continue;
+                }
                 // End navigation before the underlying tool or dialog; sketch double-Escape
                 // handling starts with the next press.
                 if app.viewport.nav.take().is_some() {
+                    app.last_escape = None;
+                    continue;
+                }
+                if crate::render_workspace::assign::cancel(app) {
                     app.last_escape = None;
                     continue;
                 }
@@ -2277,7 +2354,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                     }
                     continue;
                 }
-                if crate::sketch_text_move::cancel_drag(app) || crate::occurrence_drag::cancel(app) {
+                if crate::joint_handles::cancel(app) || crate::sketch_text_move::cancel_drag(app) || crate::occurrence_drag::cancel(app) {
                     continue;
                 }
                 if crate::select_other::is_open(app) {
@@ -2297,7 +2374,12 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
             Key::S if !mods.shift && !mods.alt => {
                 app.start("ui.palette");
             }
-            Key::V => crate::context_menu::toggle_visibility(app),
+            // With a menu open, V runs that menu's Show/Hide on what the menu is for.
+            Key::V => {
+                if !crate::context_menu::press_shortcut(app, "V") {
+                    crate::context_menu::toggle_visibility(app);
+                }
+            }
             Key::F2 => {
                 let at = ctx.input(|i| i.pointer.latest_pos()).unwrap_or(ctx.content_rect().center());
                 crate::context_menu::rename_selection(app, at);
@@ -2491,6 +2573,43 @@ mod header_report_tests {
         let name = offered.borrow().last().map(|(n, _)| n.clone()).unwrap();
         assert!(name.ends_with(".sc"), "Save As offers .sc: {name}");
         assert!(h.dir.join(&name).is_file() && old.is_file(), "Save As leaves the .solidcraft file as it was");
+    }
+
+    /// #8329: Save As (and Save a Copy) offer the name of the file the design came from, not the
+    /// name stored in the design, which a copy of the file still carries; a design renamed since
+    /// it was opened is offered its new name.
+    #[test]
+    fn save_as_offers_the_open_files_own_name() {
+        let mut h = crate::scenario::Harness::new();
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let (seen, dir) = (offered.clone(), h.dir.clone());
+        h.app.services.pick_save = Some(Box::new(move |name, _| {
+            seen.borrow_mut().push(name.to_string());
+            Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))
+        }));
+        let ask = |h: &mut crate::scenario::Harness, how: fn(&mut SolveApp)| {
+            how(&mut h.app);
+            h.frames(3);
+            h.settle();
+            offered.borrow().last().cloned().unwrap_or_default()
+        };
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.session.doc_mut().name = "Sample Plate".into();
+        assert_eq!(ask(&mut h, save_as), "Sample Plate.sc", "a new design is offered its own name");
+        // The same design under another file name, as copies of a file are (the report's
+        // "Sample Plate-bug.solidcraft"): it is still named "Sample Plate" inside.
+        let copy = h.dir.join("Sample Plate-bug.solidcraft");
+        std::fs::copy(h.dir.join("Sample Plate.sc"), &copy).unwrap();
+        h.app.run("doc.open", json!({"path": copy.to_string_lossy()})).unwrap();
+        assert_eq!(h.app.session.doc.name, "Sample Plate");
+        assert_eq!(ask(&mut h, save_as), "Sample Plate-bug.sc");
+        // Saved under that name, the file is the one Save As offers next time.
+        assert_eq!(h.app.session.path.as_deref(), Some(h.dir.join("Sample Plate-bug.sc").to_string_lossy().as_ref()));
+        assert_eq!(ask(&mut h, save_copy), "Sample Plate-bug copy.sc");
+        h.app.run("doc.open", json!({"path": copy.to_string_lossy()})).unwrap();
+        // Renamed since it was opened: the new name.
+        h.app.run("component.rename", json!({"component": 0, "name": "Plate Mk2"})).unwrap();
+        assert_eq!(ask(&mut h, save_as), "Plate Mk2.sc");
     }
 
     #[test]
@@ -2978,14 +3097,15 @@ mod header_report_tests {
             captured_frame(&mut h);
             // The report card takes a few frames to reach its full height.
             h.frames(16);
+            let close_label = if h.widget("Close draft").is_some() { "Close draft" } else { "Close" };
             // Existing review content scrolls vertically when the window is narrow.
             if width < 700.0 {
-                let [x, y] = h.widget("Close draft").unwrap();
+                let [x, y] = h.widget(close_label).unwrap();
                 h.call("ui.scroll", json!({"x":x,"y":y - 60.0,"delta":-1200}));
                 // Let the scroll animation finish before locating the click target.
                 h.frames(60);
             }
-            h.step(&json!({"widget":"Close draft"})).unwrap();
+            h.step(&json!({"widget":close_label})).unwrap();
             assert!(h.app.issue_report.draft.is_none(), "width {width}: review closes through its actual button");
             h.step(&json!({"click":{"handle":"tab:home"}})).unwrap();
             assert!(h.app.home.open, "width {width}: the Home tab remains reachable beside Report");
@@ -3176,6 +3296,22 @@ mod dropdown_tests {
         assert_eq!(h.app.tool.as_ref().map(|tool| tool.cmd), Some("sketch.line.midpoint"));
     }
 
+    /// Plain rows (Point) and family rows (Slot) span the same width, so a plain row's hover
+    /// background and pin reach the drop-down's right edge.
+    #[test]
+    fn sketch_create_plain_and_family_rows_share_both_edges() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.frames(4);
+        h.step(&json!({"click":{"handle":"panel:SKETCH:CREATE"}})).unwrap();
+        h.frames(4);
+        let point = crate::scenario::rect_of("menu:sketch.point").expect("Point is a plain row");
+        let slot = crate::scenario::rect_of("menu:Slot").expect("Slot is a family row");
+        assert!((point.left() - slot.left()).abs() < 0.5, "left edges differ: Point {point:?}, Slot {slot:?}");
+        assert!((point.right() - slot.right()).abs() < 0.5, "right edges differ: Point {point:?}, Slot {slot:?}");
+    }
+
     #[test]
     fn sketch_create_family_rows_paint_the_first_variants_icons() {
         let mut h = crate::scenario::Harness::new();
@@ -3183,7 +3319,7 @@ mod dropdown_tests {
         let cmds: Vec<_> = solidcraft_engine::command_specs().into_iter().filter(|c| c.tab == "SKETCH" && c.panel == "CREATE").collect();
         crate::icon_svg::audit::start();
         let mut output = h.ctx.run_ui(egui::RawInput::default(), |ui| {
-            sketch_create_menu(&mut h.app, ui, &cmds, &mut None, &mut None);
+            sketch_create_menu(&mut h.app, ui, &cmds, 200.0, &mut None, &mut None);
         });
         output.textures_delta.clear();
         let requested = crate::icon_svg::audit::take();
@@ -3503,6 +3639,41 @@ mod ribbon_label_tests {
             assert!((text.pos.x * scale - (text.pos.x * scale).round()).abs() < 0.001);
             assert!((text.pos.y * scale - (text.pos.y * scale).round()).abs() < 0.001);
         }
+    }
+
+    /// Every promoted button's label, in every language, sits between the button's icon and its
+    /// bottom edge, so the hover highlight holds all of it (#8391). One line stays where it was.
+    #[test]
+    fn every_promoted_label_fits_in_its_button_below_the_icon() {
+        let ctx = crate::fonts::test_context();
+        let mut two_lines = 0;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            let specs = solidcraft_engine::command_specs();
+            for section in crate::workspace::SECTIONS {
+                let (commands, count) = crate::workspace::layout(section.tab, section.panel, &specs).unwrap();
+                for command in commands.iter().take(count) {
+                    for catalog in crate::i18n::LOCALES {
+                        let locale = crate::i18n::Locale::for_language(catalog.id);
+                        let label = locale.label(crate::workspace::ribbon_button_label(command));
+                        let whole = Rect::from_min_size(pos2(40.0, 2.0), vec2(ribbon_button_width(&painter, label), BUTTON_HEIGHT));
+                        let galley = ribbon_button_galley(&painter, label, whole.width() - BUTTON_LABEL_PADDING, Color32::WHITE);
+                        let top = ribbon_label_top(whole, galley.size().y);
+                        let at = format!("{} in {}: {label:?}", command.id, catalog.id);
+                        // The icon is 26 points square, centred 16 points below the button's top.
+                        assert!(top >= whole.top() + 16.0 + 13.0, "{at} starts at {top} over the icon");
+                        assert!(top + galley.size().y <= whole.bottom() - BUTTON_LABEL_BOTTOM + 0.01, "{at} runs past the button");
+                        if galley.rows.len() == 1 {
+                            assert_eq!(top, whole.top() + BUTTON_LABEL_TOP, "{at}");
+                        } else {
+                            two_lines += 1;
+                        }
+                    }
+                }
+            }
+        });
+        output.textures_delta.clear();
+        assert!(two_lines > 0, "some labels take two lines");
     }
 
     #[test]

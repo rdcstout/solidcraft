@@ -2,7 +2,8 @@
 //! document rebuilds on load and optional display caches remain provisional. Bodies export
 //! as STL (binary or ASCII), OBJ, STEP and 3MF, and assemblies as URDF ([`urdf()`]); STEP, IGES,
 //! FreeCAD and Rhino files import as a base feature (see [`step_import_feature`]), 3MF and
-//! STL files as mesh bodies (see [`mesh_import_feature`]).
+//! STL files as mesh bodies (see [`mesh_import_feature`]), PLY and XYZ files as point clouds
+//! (see [`read_point_cloud`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -20,12 +21,17 @@ pub use design::{
     write_design_container_with_thumbnail, write_drawing_container,
 };
 mod legacy_dir;
+pub mod limits;
 #[cfg(test)]
 mod mutate;
 mod native_cad;
 pub use native_cad::{NATIVE_CAD_EXTS, is_native_cad_path, native_cad_to_step};
 pub mod library_files;
 pub mod paper;
+mod ply;
+pub use ply::{ply_counts, read_ply_mesh};
+mod point_cloud;
+pub use point_cloud::{CloudFile, DEFAULT_MAX_POINTS, MAX_POINT_CLOUD_BYTES, is_ply_path, is_point_cloud_path, read_point_cloud};
 pub mod safe_write;
 mod sketch2d;
 mod svg;
@@ -43,11 +49,13 @@ mod gltf_in;
 pub use gltf_in::{GltfImport, Loader, MAX_GLTF_BYTES, MeshPlan, PlanPlace, glb_container, is_gltf_path, read_gltf};
 mod obj;
 pub use obj::read_obj;
-pub use threemf::{MAX_3MF_BYTES, MeshObject, model_xml, model_xml_with, read_3mf, weld, write_3mf, write_3mf_with};
+pub use threemf::{
+    MAX_3MF_BYTES, MeshObject, model_xml, model_xml_parts, model_xml_with, read_3mf, weld, write_3mf, write_3mf_parts, write_3mf_with,
+};
 pub use urdf::{UrdfOptions, UrdfPackage, urdf};
 
 use solidcraft_doc::{Document, Metadata, ModelState};
-use solidcraft_geom::{Mesh, Vec3};
+use solidcraft_geom::{MassProperties, Mesh, Vec3};
 
 /// Design file extension: new designs, autosaves and recovery files are written as `.sc`.
 pub const DESIGN_EXT: &str = "sc";
@@ -80,7 +88,7 @@ pub const DRAWING_EXT: &str = "scdwg";
 pub fn is_drawing_path(path: &str) -> bool {
     std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(DRAWING_EXT))
 }
-/// Largest design file we read.
+/// Largest design file read by default; the desktop app may raise it ([`limits`], #4086).
 pub const MAX_DESIGN_BYTES: usize = 256 << 20;
 
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +107,7 @@ pub enum IoError {
 
 pub type Result<T> = std::result::Result<T, IoError>;
 
-/// Largest STEP file we read.
+/// Largest STEP (or import) file read by default; the desktop app may raise it ([`limits`], #4086).
 pub const MAX_STEP_BYTES: usize = 512 << 20;
 
 /// Is this a CAD file read as an Import base feature: STEP (`.step` / `.stp`), IGES
@@ -226,9 +234,7 @@ pub fn step_import_feature(bytes: &[u8], file: &str) -> Result<StepFeature> {
 
 /// [`step_import_feature`], with the bodies named after `names`.
 pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> Result<StepFeature> {
-    if bytes.len() > MAX_STEP_BYTES {
-        return Err(IoError::Invalid(format!("STEP file too large ({} MB, limit {} MB)", bytes.len() >> 20, MAX_STEP_BYTES >> 20)));
-    }
+    limits::check(limits::Kind::Step, bytes.len() as u64).map_err(IoError::Invalid)?;
     // STEP is 7-bit text with escapes; tolerate stray 8-bit bytes. IGES and the cadmpeg formats
     // are restated as STEP (the feature keeps that STEP text).
     let (text, iges_warnings) = if is_native_cad_path(file) {
@@ -279,7 +285,7 @@ pub struct MeshFeature {
     pub warnings: Vec<String>,
 }
 
-/// Read 3MF, STL, OBJ or glTF bytes (the format from `file`'s extension) into a MeshImport
+/// Read 3MF, STL, OBJ, PLY or glTF bytes (the format from `file`'s extension) into a MeshImport
 /// feature. A glTF file's bodies are all built where they are (see [`read_gltf`] for its node
 /// tree), and it can't read buffers in other files.
 pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
@@ -297,6 +303,8 @@ pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let (objects, warnings) = if ext == "obj" {
         obj::read_obj(bytes, &stem)?
+    } else if ext == "ply" {
+        ply::read_ply_mesh(bytes, &stem)?
     } else if ext == "stl" {
         let tris = read_stl(bytes)?;
         if tris.is_empty() {
@@ -416,6 +424,14 @@ pub fn export_mesh_at(b: &solidcraft_kernel::Body, quality: MeshQuality) -> Resu
 /// Distance within which an exported mesh's vertices are welded (STL and 3MF alike).
 fn weld_eps(b: &solidcraft_kernel::Body) -> f64 {
     (b.size() * 1e-6).max(1e-7)
+}
+
+/// Unit-density [`MassProperties`] of a body from its welded [`export_mesh`], the mesh URDF links
+/// take their inertia from; `None` when that mesh does not close (an open surface).
+pub fn mass_properties(b: &solidcraft_kernel::Body) -> Result<Option<MassProperties>> {
+    let m = export_mesh(b)?;
+    let (positions, triangles) = weld(&m.positions, &m.triangles, weld_eps(b));
+    Ok(Mesh { positions, triangles, ..Mesh::default() }.mass_properties())
 }
 
 /// Binary STL of several meshes (one solid).
@@ -678,6 +694,21 @@ pub fn export_with_quality(
     meta: &Metadata,
     quality: MeshQuality,
 ) -> Result<Vec<u8>> {
+    export_with_parts(state, bodies, &[], format, name, meta, quality)
+}
+
+/// [`export_with_quality`], and in 3MF each of `parts` (a name and the names of its bodies)
+/// written as one object with those bodies as its parts ([`model_xml_parts`], #8139).
+/// Bodies of a part that are not exported are left out of it. Other formats have no parts.
+pub fn export_with_parts(
+    state: &ModelState,
+    bodies: &[String],
+    parts: &[(String, Vec<String>)],
+    format: Format,
+    name: &str,
+    meta: &Metadata,
+    quality: MeshQuality,
+) -> Result<Vec<u8>> {
     let sel = selected(state, bodies)?;
     Ok(match format {
         Format::StlBinary | Format::StlAscii => {
@@ -711,7 +742,9 @@ pub fn export_with_quality(
         }
         Format::ThreeMf | Format::ThreeMfTagged => {
             let objs: Vec<MeshObject> = sel.iter().map(|b| mesh_object(b, format == Format::ThreeMfTagged, quality)).collect::<Result<_>>()?;
-            write_3mf_with(&objs, &threemf_metadata(meta))?
+            let index = |n: &String| sel.iter().position(|b| &b.name == n);
+            let parts: Vec<(String, Vec<usize>)> = parts.iter().map(|(p, names)| (p.clone(), names.iter().filter_map(index).collect())).collect();
+            write_3mf_parts(&objs, &parts, &threemf_metadata(meta))?
         }
         Format::Design => return Err(IoError::Format("sc (save the document instead)".into())),
         Format::Urdf => return Err(IoError::Format("urdf (an assembly package; use file.export)".into())),
@@ -788,9 +821,7 @@ pub fn step_assembly(doc: &Document, local: &ModelState, name: &str) -> Result<V
 
 /// Read a design file's bytes.
 pub fn read_design(bytes: &[u8]) -> Result<Document> {
-    if bytes.len() > MAX_DESIGN_BYTES {
-        return Err(IoError::Invalid("design file too large".into()));
-    }
+    limits::check(limits::Kind::Design, bytes.len() as u64).map_err(|e| IoError::Invalid(format!("design {e}")))?;
     if is_design_container(bytes) {
         return design::read(bytes);
     }

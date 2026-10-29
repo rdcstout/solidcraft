@@ -12,7 +12,9 @@ pub const DOCUMENTED: &[&str] = &[
     "component.finish_edit",
     "face.delete",
     "material.assign",
+    "occurrence.move",
     "parameters.change",
+    "pointcloud.insert",
     "solid.align",
     "solid.chamfer",
     "solid.combine",
@@ -37,6 +39,7 @@ pub const DOCUMENTED: &[&str] = &[
     "solid.sweep",
     "timeline.compute_all",
     "timeline.delete",
+    "timeline.play",
 ];
 
 /// The help for `command` in the current language, when it has any.
@@ -262,7 +265,6 @@ mod tests {
         "sketch.line3d",
         "sketch.mirror",
         "sketch.move",
-        "sketch.move3d",
         "sketch.offset",
         "sketch.paste",
         "sketch.pattern.circular",

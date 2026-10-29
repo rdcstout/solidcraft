@@ -1,4 +1,6 @@
 {
+  "order": 250,
+  "provenance": "Original mapping of the IBM Color Graphics Adapter palette",
   "base": "dark",
   "colors": {
     "accent": "#55ffff",
@@ -91,6 +93,8 @@
     "icons.highlight": "#ffffff",
     "icons.marker_halo": "#000000cc",
     "interference": "#ff5555",
+    "joint_axis": "#aaaaaa",
+    "joint_manipulator": "#ffff55",
     "library_highlights": [
       "#ff5555",
       "#ffff55",
@@ -149,6 +153,7 @@
     "sketch": "#55ffff",
     "sketch_accent": "#ff55ff",
     "sketch_centerline": "#ffff55",
+    "sketch_conflict": "#ff5555",
     "sketch_construction": "#aaaaaa",
     "sketch_fixed": "#ffffff",
     "sketch_halo": "#000000",

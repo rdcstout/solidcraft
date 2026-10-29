@@ -175,7 +175,68 @@ pub fn sphere_thumbnail(ui: &mut Ui, id: &str, sphere: Sphere, size: f32) -> Res
     response
 }
 
-/// A catalog sample: 48 pt sphere in a 56 pt cell, two-line caption and optional
+/// Inspector sample card. Content, chips and action reuse the kit's existing
+/// controls; dimensions and the bordered card belong here rather than callers.
+#[cfg(test)]
+pub(crate) fn sphere_preview<R>(ui: &mut Ui, id: &str, sphere: Sphere, name: &str, chips: [&str; 2], action: impl FnOnce(&mut Ui) -> R) -> R {
+    sphere_preview_with_source(ui, id, sphere, name, chips[1], |ui| super::text(ui, chips[0], super::Text::Inline), action)
+}
+
+/// Sample card with an interactive source tag (for example an inheritance menu).
+/// Keeps the standard sphere, two-line caption, usage chip and trailing action.
+/// Tokens and dimensions are identical to the plain sample card.
+pub(crate) fn sphere_preview_with_source<R>(
+    ui: &mut Ui,
+    id: &str,
+    sphere: Sphere,
+    name: &str,
+    usage: &str,
+    source: impl FnOnce(&mut Ui) -> Response,
+    action: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let t = Tokens::get();
+    super::reports::list_frame_filled(ui, id, t.dialog_footer, t.space_10, |ui| {
+        let row = ui.horizontal(|ui| {
+            let side = t.control_height * 2.0 - t.space_8;
+            sphere_thumbnail(ui, id, sphere, side);
+            let text_width = (ui.available_width() - t.control_height - t.space_16).max(0.0);
+            ui.allocate_ui_with_layout(vec2(text_width, side), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = t.space_4;
+                ui.add_sized(
+                    vec2(text_width, t.space_16),
+                    egui::Label::new(egui::RichText::new(name).font(crate::fonts::semibold(t.font_label)).color(t.form_ink))
+                        .truncate()
+                        .halign(egui::Align::Min),
+                )
+                .on_hover_text(name);
+                let (line, _) = ui.allocate_exact_size(vec2(text_width, t.control_height), Sense::hover());
+                let usage_width = (ui.painter().layout_no_wrap(usage.to_owned(), egui::FontId::proportional(t.font_caption), t.form_ink).size().x
+                    + t.space_12)
+                    .min((text_width - t.space_24 - t.space_8).max(0.0));
+                let usage_rect = Rect::from_min_max(pos2(line.right() - usage_width, line.top()), line.max);
+                let source_rect = Rect::from_min_max(line.min, pos2((usage_rect.left() - t.space_4).max(line.left()), line.bottom()));
+                let mut source_ui = ui.new_child(
+                    egui::UiBuilder::new().id_salt("sample_source").max_rect(source_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                source_ui.set_clip_rect(ui.clip_rect().intersect(source_rect));
+                let source = source(&mut source_ui);
+                scenario::publish_rect(&format!("{id}:chip:0"), source.rect.intersect(source_rect));
+                let mut usage_ui = ui.new_child(
+                    egui::UiBuilder::new().id_salt("sample_usage").max_rect(usage_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                usage_ui.set_clip_rect(ui.clip_rect().intersect(usage_rect));
+                let response = super::workspace_chip(&mut usage_ui, usage);
+                scenario::publish_rect(&format!("{id}:chip:1"), response.rect.intersect(usage_rect));
+            });
+            let response = ui.vertical(action);
+            scenario::publish_target(&format!("{id}:replace"), response.response.rect);
+            response.inner
+        });
+        row.inner
+    })
+}
+
+/// A catalog sample: a token-sized sphere, two-line caption and optional
 /// usage badge. The surrounding chrome follows the active workspace accent.
 pub(crate) struct SphereTile<'a> {
     pub id: &'a str,
@@ -184,43 +245,54 @@ pub(crate) struct SphereTile<'a> {
     pub selected: bool,
     pub users: usize,
     pub tip: &'a str,
+    pub badge: Option<&'a str>,
 }
 
 impl SphereTile<'_> {
     pub(crate) fn show(&self, ui: &mut Ui) -> Response {
         let t = Tokens::get();
         let accent = crate::theme::TabAccent::current(ui.ctx());
-        let side = t.control_height * 2.0;
-        let height = side + t.space_3 + t.font_small * 2.5 + t.space_4;
+        let side = t.control_height + t.space_6;
+        let line_height = ui.fonts_mut(|fonts| fonts.row_height(&crate::fonts::semibold(t.font_small)));
+        let height = t.space_16 + side + t.space_6 + line_height * 2.0 + t.space_3;
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-        let response = ui.interact(rect, ui.make_persistent_id(self.id), Sense::click());
-        let cell = Rect::from_min_size(pos2(rect.center().x - side / 2.0, rect.top() + t.space_4), vec2(side, side));
+        let response = ui.interact(rect, ui.make_persistent_id(self.id), Sense::click_and_drag());
+        let cell = rect;
         ui.painter().rect_filled(cell, t.radius_xl, t.control_fill);
         ui.painter().rect_stroke(cell, t.radius_xl, t.control_border_stroke(t.dialog_rule), egui::StrokeKind::Inside);
         if self.selected || response.hovered() || response.has_focus() {
-            ui.painter().rect_stroke(cell.expand(t.space_2), t.radius_xl, egui::Stroke::new(t.space_2, accent.ink), egui::StrokeKind::Outside);
+            ui.painter().rect_stroke(cell, t.radius_xl, egui::Stroke::new(t.space_2, accent.ink), egui::StrokeKind::Inside);
         }
-        paint_sphere(ui, cell.shrink(t.space_4), self.sphere);
+        let preview = Rect::from_min_size(pos2(rect.center().x - side / 2.0, rect.top() + t.space_16), vec2(side, side));
+        paint_sphere(ui, preview, self.sphere);
+        if let Some(badge) = self.badge {
+            ui.painter().text(
+                cell.left_top() + vec2(t.space_4, t.space_4),
+                egui::Align2::LEFT_TOP,
+                badge,
+                crate::fonts::semibold(t.font_badge),
+                t.form_dim,
+            );
+        }
         if self.users > 0 {
             let text = if self.users > 99 { "99+".into() } else { self.users.to_string() };
             let galley = ui.painter().layout_no_wrap(text, crate::fonts::semibold(t.font_badge), t.on_accent);
             let width = (galley.size().x + t.space_8).max(t.space_16);
-            let badge = Rect::from_min_size(pos2(cell.right() + t.space_2 - width, cell.top() - t.space_2), vec2(width, t.space_16));
+            let badge = Rect::from_min_size(pos2(cell.right() - t.space_4 - width, cell.top() + t.space_2), vec2(width, t.space_16));
             ui.painter().rect_filled(badge, t.radius_lg, accent.ink);
             ui.painter().galley(badge.center() - galley.size() / 2.0, galley, t.on_accent);
         }
-        let label = Rect::from_min_max(pos2(rect.left(), cell.bottom() + t.space_3), rect.max);
+        let label = Rect::from_min_max(pos2(rect.left() + t.space_3, preview.bottom() + t.space_6), rect.max - vec2(t.space_3, t.space_3));
         let font = if self.selected { crate::fonts::semibold(t.font_small) } else { egui::FontId::proportional(t.font_small) };
         let mut job = egui::text::LayoutJob::simple(self.name.to_owned(), font, t.form_ink, label.width());
         job.halign = egui::Align::Center;
         job.wrap.max_rows = 2;
         job.wrap.break_anywhere = false;
         let galley = ui.painter().layout_job(job);
-        ui.painter().with_clip_rect(ui.clip_rect().intersect(label)).galley(
-            pos2(label.center().x - galley.rect.center().x, label.top() - galley.rect.top()),
-            galley,
-            t.form_ink,
-        );
+        let label_pos = pos2(label.center().x - galley.rect.center().x, label.top() - galley.rect.top());
+        scenario::publish_rect(&format!("{}:label", self.id), label);
+        scenario::publish_rect(&format!("{}:galley", self.id), galley.rect.translate(label_pos.to_vec2()));
+        ui.painter().with_clip_rect(ui.clip_rect().intersect(label)).galley(label_pos, galley, t.form_ink);
         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), self.selected, self.name));
         scenario::publish_target(self.id, rect);
         let mut tip = egui::Tooltip::for_enabled(&response);
@@ -232,23 +304,45 @@ impl SphereTile<'_> {
     }
 }
 
+/// Noninteractive cursor sphere, shared by drag-and-drop and paint tools.
+pub(crate) fn sphere_cursor(ui: &mut egui::Ui, sphere: Sphere) {
+    if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+        let t = Tokens::get();
+        let rect = Rect::from_min_size(pointer + vec2(t.space_12, t.space_12), vec2(t.control_height, t.control_height));
+        let mut ghost =
+            ui.new_child(egui::UiBuilder::new().layer_id(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("sphere_cursor"))).max_rect(rect));
+        ghost.set_clip_rect(ui.ctx().content_rect());
+        paint_sphere(&ghost, rect, sphere);
+    }
+}
+
 /// Fixed-column catalog composition. Tile geometry and gaps stay with the kit.
 pub(crate) fn sphere_grid(ui: &mut Ui, tiles: &[SphereTile<'_>]) -> Option<usize> {
+    sphere_grid_drag(ui, tiles).0
+}
+
+/// Grid click and drag-start events; callers own the drag payload and drop policy.
+pub(crate) fn sphere_grid_drag(ui: &mut Ui, tiles: &[SphereTile<'_>]) -> (Option<usize>, Option<usize>) {
     let t = Tokens::get();
     let mut clicked = None;
-    ui.spacing_mut().item_spacing = vec2(t.space_2, t.space_8);
+    let mut dragged = None;
+    ui.spacing_mut().item_spacing = vec2(t.space_8, t.space_8);
     for (row, chunk) in tiles.chunks(3).enumerate() {
         ui.columns(3, |columns| {
             for (column, tile) in chunk.iter().enumerate() {
-                if let Some(ui) = columns.get_mut(column)
-                    && tile.show(ui).clicked()
-                {
-                    clicked = Some(row * 3 + column);
+                if let Some(ui) = columns.get_mut(column) {
+                    let response = tile.show(ui);
+                    if response.clicked() {
+                        clicked = Some(row * 3 + column);
+                    }
+                    if response.drag_started() {
+                        dragged = Some(row * 3 + column);
+                    }
                 }
             }
         });
     }
-    clicked
+    (clicked, dragged)
 }
 
 #[cfg(test)]

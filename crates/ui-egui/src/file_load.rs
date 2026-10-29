@@ -85,6 +85,7 @@ impl Request {
         match &self.kind {
             Kind::Open => ("doc.open", self.params()),
             Kind::Insert if solidcraft_engine::io::is_mesh_path(&self.path) => ("file.insert_mesh", self.params()),
+            Kind::Insert if solidcraft_engine::io::is_point_cloud_path(&self.path) => ("pointcloud.insert", self.params()),
             Kind::Insert => (insert_command(&self.path), self.params()),
             Kind::Recover { id, dir } => ("doc.recover", json!({"id": id, "dir": dir})),
             Kind::ExportDxf => ("file.export_view_dxf", Value::Object(self.options.clone())),
@@ -346,7 +347,7 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
     let command = req.params.get("command").or(req.params.get("id")).and_then(Value::as_str);
     let kind = match command {
         Some("doc.open") => Kind::Open,
-        Some("file.insert_step" | "file.insert_mesh") => Kind::Insert,
+        Some("file.insert_step" | "file.insert_mesh" | "pointcloud.insert") => Kind::Insert,
         Some("file.export_view_dxf") => Kind::ExportDxf,
         _ => return Some(req),
     };
@@ -623,7 +624,7 @@ fn step_staged(running: &mut Running) {
         // Parse and walk the file. The reading keeps the watch: its steps report progress and
         // stop on Cancel.
         let read = solidcraft_engine::io::vfs::scoped(scope, || {
-            let bytes = solidcraft_engine::io::vfs::read(&path, solidcraft_engine::io::MAX_STEP_BYTES).map_err(|e| format!("{path}: {e}"))?;
+            let bytes = solidcraft_engine::io::limits::read(&path, solidcraft_engine::io::limits::Kind::Step).map_err(|e| format!("{path}: {e}"))?;
             // The same text the import command makes of the bytes, so it finds this reading.
             let text = String::from_utf8_lossy(&bytes).into_owned();
             solidcraft_engine::doc::progress::watch(progress.clone(), || solidcraft_engine::kernel::StepReading::new(&text))
@@ -1284,6 +1285,19 @@ mod tests {
             h.app.insert_path(&path);
             assert_eq!(h.app.session.doc.sketch(new_id).unwrap().curves.len(), 4);
         }
+    }
+
+    #[test]
+    fn point_cloud_insert_keeps_all_options_on_the_worker_request() {
+        let mut request = Request::new("scan.PLY", Kind::Insert);
+        request.options =
+            json!({"units": "m", "max_points": 1000, "color_by": "height", "height_range": [1, 20], "name": "Scan"}).as_object().unwrap().clone();
+        let (command, params) = request.command();
+        assert_eq!(command, "pointcloud.insert");
+        assert_eq!(
+            params,
+            json!({"path": "scan.PLY", "units": "m", "max_points": 1000, "color_by": "height", "height_range": [1, 20], "name": "Scan"})
+        );
     }
 
     #[test]

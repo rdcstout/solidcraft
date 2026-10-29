@@ -12,6 +12,10 @@ use egui::{Ui, vec2};
 /// Text segments retain mixed states and optional compact clipping instead of dropdown fallback.
 #[derive(Default)]
 pub(crate) struct Segments<'a> {
+    /// Per-option availability; omitted entries are enabled. Unavailable options stay faded.
+    pub enabled: &'a [bool],
+    /// Optional per-option refusal reasons. Disabled options remain visible and explain why.
+    pub disabled: &'a [Option<&'a str>],
     /// Optional stable scenario targets, independent of translated option labels.
     pub targets: &'a [&'a str],
     /// Optional leading icons retain the same text-segment geometry and accessibility.
@@ -20,6 +24,8 @@ pub(crate) struct Segments<'a> {
     pub dense: bool,
     pub small: bool,
     pub states: &'a [bool],
+    /// Per-segment disabled explanation; unavailable choices remain visible.
+    pub disabled_reasons: &'a [Option<&'a str>],
     pub compact: bool,
     pub primary: bool,
     pub intrinsic: bool,
@@ -33,7 +39,21 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
     if crate::prefs_search::querying(ui) && !crate::prefs_search::shows_all(ui) {
         crate::prefs_search::reveal(ui);
     }
-    let Segments { targets, icons, workspace_accent, dense, small, states, compact, primary, intrinsic, proportional } = config;
+    let Segments {
+        enabled,
+        disabled,
+        targets,
+        icons,
+        workspace_accent,
+        dense,
+        small,
+        states,
+        disabled_reasons,
+        compact,
+        primary,
+        intrinsic,
+        proportional,
+    } = config;
     let accent = crate::theme::TabAccent::current(ui.ctx());
     let t = Tokens::get();
     let catalog = super::layout::in_catalog(ui);
@@ -55,7 +75,13 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
         .fold(0.0, f32::max);
     // Judged on the whole row, which is what a scrollbar narrows, not on one segment.
     let need = if intrinsic { total } else { (widest + 2.0 * t.space_8) * options.len() as f32 };
-    if !proportional && !compact && !super::fits_steadily(ui, label(ui), need, segment_width * options.len() as f32) {
+    if enabled.is_empty()
+        && disabled.is_empty()
+        && disabled_reasons.is_empty()
+        && !proportional
+        && !compact
+        && !super::fits_steadily(ui, label(ui), need, segment_width * options.len() as f32)
+    {
         let before = *selected;
         let id = format!("segments_fallback_{}", label(ui));
         dropdown(ui, &id, selected, options);
@@ -86,7 +112,17 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
             if (intrinsic || proportional) && total > 0.0 { natural.get(index).copied().unwrap_or(0.0) * rect.width() / total } else { equal_width };
         let segment = egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(width, rect.height()));
         x += width;
-        let response = ui.interact(segment, ui.make_persistent_id(("segment", index)), egui::Sense::click());
+        let reason = disabled_reasons.get(index).copied().flatten().or_else(|| disabled.get(index).copied().flatten());
+        let id = ui.make_persistent_id(("segment", index));
+        // The row is already allocated: a child scopes disabled painting and interaction
+        // without advancing the parent's cursor once per segment.
+        let mut segment_ui = ui.new_child(egui::UiBuilder::new().max_rect(segment));
+        if !enabled.get(index).copied().unwrap_or(true) || reason.is_some() {
+            segment_ui.disable();
+        }
+        let ui = &mut segment_ui;
+        let segment_enabled = ui.is_enabled();
+        let response = ui.interact(segment, id, egui::Sense::click());
         let on = states.get(index).copied().unwrap_or(*selected == index);
         let rounding = egui::CornerRadius {
             nw: if index == 0 { t.control_radius } else { 0 },
@@ -132,7 +168,9 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
             text_rect,
             option,
             font,
-            if on && primary {
+            if !segment_enabled {
+                t.form_dim
+            } else if on && primary {
                 t.on_accent
             } else if on && workspace_accent {
                 accent.ink
@@ -144,7 +182,7 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
             false,
         );
         t.button_bevel_with_radius(ui, &response, on, rounding);
-        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, *option));
+        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, segment_enabled, on, *option));
         scenario::publish_target(&format!("dialog:{}:{option}", label(ui)), segment);
         if let Some(target) = targets.get(index) {
             let visible = segment.intersect(ui.clip_rect());
@@ -152,7 +190,8 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
                 scenario::publish_target(target, visible);
             }
         }
-        if response.on_hover_text(*option).clicked() {
+        let response = if let Some(reason) = reason { response.on_disabled_hover_text(reason) } else { response.on_hover_text(*option) };
+        if response.clicked() && segment_enabled {
             *selected = index;
             clicked = true;
         }
@@ -582,6 +621,19 @@ pub(crate) fn popup_list(
     let t = crate::theme::Tokens::get();
     let mut chosen = None;
     let mut rows = Vec::with_capacity(options.len());
+    // Wide enough for the longest suggestion; still capped so a hostile name cannot fill the screen (#8533).
+    let mono = egui::FontId::monospace(t.font_body);
+    let kind_font = egui::FontId::proportional(t.font_small);
+    let content_w = options
+        .iter()
+        .map(|option| {
+            let text_w = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(option.text.to_owned(), mono.clone(), option.color)).size().x;
+            let kind = crate::i18n::tr_label(option.kind);
+            let kind_w = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(kind.to_owned(), kind_font.clone(), t.form_dim)).size().x;
+            text_w + kind_w + t.space_8 * 3.0
+        })
+        .fold(0.0_f32, f32::max);
+    let width = anchor.width().max(t.form_card_width - t.space_16 * 2.0 - t.space_2).max(content_w).min(t.form_card_width * 2.5);
     let popup = Container::new(ctx, Surface::Popup).area(id);
     let area = popup.order(egui::Order::Tooltip).fixed_pos(anchor.left_bottom() + egui::vec2(0.0, t.space_2)).show(ctx, |ui| {
         Container::popup_frame(ui.style())
@@ -591,7 +643,7 @@ pub(crate) fn popup_list(
             .inner_margin(t.space_4)
             .show(ui, |ui| {
                 super::scope(ui, |ui| {
-                    ui.set_width(anchor.width().max(t.form_card_width - t.space_16 * 2.0 - t.space_2));
+                    ui.set_width(width);
                     for (index, option) in options.iter().enumerate() {
                         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), t.control_height), egui::Sense::CLICK);
                         rows.push(rect);
@@ -606,23 +658,12 @@ pub(crate) fn popup_list(
                             inner.min,
                             egui::pos2((inner.right() - kind_width - t.space_8).max(inner.left()), inner.bottom()),
                         );
-                        super::text::paint_text(
-                            ui,
-                            text_rect,
-                            option.text,
-                            egui::FontId::monospace(t.font_body),
-                            if picked { t.form_primary } else { option.color },
-                            false,
-                        );
-                        ui.painter().text(
-                            inner.right_center(),
-                            egui::Align2::RIGHT_CENTER,
-                            kind,
-                            egui::FontId::proportional(t.font_small),
-                            t.form_dim,
-                        );
+                        super::text::paint_text(ui, text_rect, option.text, mono.clone(), if picked { t.form_primary } else { option.color }, false);
+                        ui.painter().text(inner.right_center(), egui::Align2::RIGHT_CENTER, kind, kind_font.clone(), t.form_dim);
                         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), picked, option.text));
-                        let response = response.on_hover_text(option.detail);
+                        // Tip the full name first: long identifiers still clip inside a capped popup.
+                        let tip = if option.detail.is_empty() { option.text.to_owned() } else { format!("{}\n{}", option.text, option.detail) };
+                        let response = response.on_hover_text(tip);
                         crate::scenario::publish_handle(&format!("dialog:suggestion:{index}"), response.rect.center());
                         if response.clicked() {
                             chosen = Some(index);

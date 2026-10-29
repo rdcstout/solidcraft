@@ -335,7 +335,8 @@ pub fn left_timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
 
 fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
     let t = Tokens::get();
-    let count = crate::ui_kit::HistoryTransport::ALL.len() as f32;
+    let mut controls = crate::ui_kit::HistoryTransport::shown(app.preferences.history_play_button);
+    let count = controls.len() as f32;
     let height = if names { crate::ui_kit::TREE_ROW_HEIGHT } else { t.control_height * count + t.space_2 * (count - 1.0) };
     let (header, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     crate::scenario::publish_rect("history:transport", header);
@@ -362,7 +363,11 @@ fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         let handle = crate::ui_kit::panel_grip(&mut grip).rect;
-        let controls_width = crate::ui_kit::history_transport_width();
+        // A named column too narrow for five buttons beside its grip leaves Play to the ribbon.
+        if controls_right - crate::ui_kit::history_controls_width(controls.len()) < handle.right() + t.space_2 {
+            controls = &crate::ui_kit::HistoryTransport::ALL;
+        }
+        let controls_width = crate::ui_kit::history_controls_width(controls.len());
         let title = crate::i18n::tr("ui.history_title");
         let galley = ui.painter().layout_no_wrap(title.to_owned(), crate::fonts::semibold(t.font_heading), t.text);
         let text_left = handle.right() + t.space_8;
@@ -379,19 +384,21 @@ fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
         crate::scenario::publish_handle("history:grip", drag_rect.center());
         dock_drag(app, ui, &drag);
     }
-    for (i, control) in crate::ui_kit::HistoryTransport::ALL.into_iter().enumerate() {
+    for (i, &control) in controls.iter().enumerate() {
         let side = if names { t.space_24 } else { t.control_height };
         let rect = if names {
             Rect::from_min_size(
-                pos2(controls_right - crate::ui_kit::history_transport_width() + i as f32 * (side + t.space_2), header.center().y - side / 2.0),
+                pos2(
+                    controls_right - crate::ui_kit::history_controls_width(controls.len()) + i as f32 * (side + t.space_2),
+                    header.center().y - side / 2.0,
+                ),
                 vec2(side, side),
             )
         } else {
             Rect::from_min_size(pos2(header.center().x - side / 2.0, header.top() + i as f32 * (side + t.space_2)), vec2(side, side))
         };
-        if control.show(ui, rect).clicked() {
-            crate::timeline::run_transport(app, control);
-        }
+        let response = control.show(ui, rect, app.timeline_playback.is_some());
+        crate::timeline::transport_response(app, control, &response);
     }
 }
 
@@ -669,7 +676,7 @@ fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft
     let selected_groups = app.tree.picked_timeline_groups.clone();
     let has_selection = !features.is_empty() || !selected_groups.is_empty();
     if has_selection {
-        if crate::context_menu::button(ui, "Add to New Folder", "folder").clicked() {
+        if crate::context_menu::button(ui, "Add to New Folder", "feature_group").clicked() {
             let result = app.run("timeline.group", json!({"features": features, "groups": selected_groups}));
             if let Ok(result) = result
                 && let Some(group) = result.get("group").and_then(serde_json::Value::as_u64)
@@ -680,7 +687,7 @@ fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft
             ui.close();
         }
         let grouped = features.iter().any(|feature| group_for(groups, *feature).is_some()) || !selected_groups.is_empty();
-        if grouped && crate::context_menu::button(ui, "Remove from Folder", "folder").clicked() {
+        if grouped && crate::context_menu::button(ui, "Remove from Folder", "feature_group").clicked() {
             let mut params = json!({"group": null});
             if !features.is_empty() {
                 params["features"] = json!(features);
@@ -708,9 +715,13 @@ fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft
         // The folders' own features and those of nested folders, as `timeline.suppress` and
         // `timeline.delete` take them with `groups` (#7219).
         let contents = folder_features(app, &selected_groups);
-        let all_suppressed = !contents.is_empty() && contents.iter().all(|id| app.session.doc.feature(*id).is_some_and(|f| f.suppressed));
+        let joints = folder_joints(app, &selected_groups);
+        let has_contents = !contents.is_empty() || !joints.is_empty();
+        let all_suppressed = has_contents
+            && contents.iter().all(|id| app.session.doc.feature(*id).is_some_and(|f| f.suppressed))
+            && joints.iter().all(|id| app.session.doc.assembly.joints.iter().any(|joint| joint.id == *id && joint.suppressed));
         let label = if all_suppressed { "Unsuppress Selected Folders" } else { "Suppress Selected Folders" };
-        if crate::context_menu::button_enabled(ui, label, "suppress", !contents.is_empty())
+        if crate::context_menu::button_enabled(ui, label, "suppress", has_contents)
             .on_hover_text(crate::i18n::tr("timeline.suppress_folders_tip"))
             .clicked()
         {
@@ -775,6 +786,15 @@ fn folder_features(app: &SolveApp, roots: &[u64]) -> Vec<u64> {
     app.session.doc.features.iter().map(|feature| feature.id).filter(|feature| inside(*feature)).collect()
 }
 
+fn folder_joints(app: &SolveApp, roots: &[u64]) -> Vec<u64> {
+    let groups = &app.session.doc.timeline_groups;
+    groups
+        .iter()
+        .filter(|group| roots.contains(&group.id) || roots.iter().any(|root| group_is_descendant(groups, group.id, *root)))
+        .flat_map(|group| group.joints.iter().copied())
+        .collect()
+}
+
 fn group_is_descendant(groups: &[solidcraft_engine::doc::TimelineGroup], group: u64, ancestor: u64) -> bool {
     let mut current = groups.iter().find(|candidate| candidate.id == group).and_then(|candidate| candidate.parent);
     let mut steps = 0usize;
@@ -789,6 +809,19 @@ fn group_is_descendant(groups: &[solidcraft_engine::doc::TimelineGroup], group: 
         current = groups.iter().find(|candidate| candidate.id == id).and_then(|candidate| candidate.parent);
     }
     false
+}
+
+/// A parent sorts immediately before its descendants, including folders with only joints.
+fn group_path(groups: &[solidcraft_engine::doc::TimelineGroup], id: u64) -> Vec<u64> {
+    let mut path = Vec::new();
+    let mut current = Some(id);
+    for _ in 0..groups.len() {
+        let Some(id) = current else { break };
+        path.push(id);
+        current = groups.iter().find(|group| group.id == id).and_then(|group| group.parent);
+    }
+    path.reverse();
+    path
 }
 
 fn group_depth(groups: &[solidcraft_engine::doc::TimelineGroup], id: u64) -> usize {
@@ -858,8 +891,25 @@ fn group_last_feature(
     direct.into_iter().chain(children).max()
 }
 
+/// A folder with only joints shares its nearest feature-bearing ancestor's position.
+fn group_position(
+    groups: &[solidcraft_engine::doc::TimelineGroup],
+    features: &[(u64, String, &'static str, bool, &'static str, TimelineKind)],
+    id: u64,
+) -> Option<usize> {
+    let mut current = Some(id);
+    for _ in 0..groups.len() {
+        let id = current?;
+        if let Some(first) = group_first_feature(groups, features, id) {
+            return Some(first);
+        }
+        current = groups.iter().find(|group| group.id == id).and_then(|group| group.parent);
+    }
+    None
+}
+
 /// Whether Sketches: Under their feature is on (#6489).
-fn nests(app: &SolveApp) -> bool {
+pub(crate) fn nests(app: &SolveApp) -> bool {
     app.preferences.history_sketches == crate::prefs::HistorySketches::UnderFeature
 }
 
@@ -877,7 +927,7 @@ fn drawn_rows(app: &SolveApp, nest: bool) -> HistoryRows {
 }
 
 /// The fold of a feature's listed sketches; closed until opened.
-fn sketches_key(feature: u64) -> String {
+pub(crate) fn sketches_key(feature: u64) -> String {
     format!("timeline/feature/{feature}/sketches")
 }
 
@@ -890,8 +940,8 @@ fn visible_order(
     let mut order = Vec::new();
     let mut shown = std::collections::BTreeSet::new();
     for (index, (id, ..)) in features.iter().enumerate() {
-        let mut at_index: Vec<_> = groups.iter().filter(|group| group_first_feature(groups, features, group.id) == Some(index)).collect();
-        at_index.sort_by_key(|group| (group_depth(groups, group.id), group.id));
+        let mut at_index: Vec<_> = groups.iter().filter(|group| group_position(groups, features, group.id) == Some(index)).collect();
+        at_index.sort_by_key(|group| group_path(groups, group.id));
         for group in at_index {
             if group_ancestors_are_open(app, groups, group.id) && shown.insert(group.id) {
                 order.push(TimelineItem::Group(group.id));
@@ -909,7 +959,7 @@ fn visible_order(
         }
     }
     let mut trailing: Vec<_> = groups.iter().filter(|group| !shown.contains(&group.id)).collect();
-    trailing.sort_by_key(|group| (group_first_feature(groups, features, group.id).unwrap_or(usize::MAX), group_depth(groups, group.id), group.id));
+    trailing.sort_by_key(|group| (group_position(groups, features, group.id).unwrap_or(usize::MAX), group_path(groups, group.id)));
     for group in trailing {
         if group_ancestors_are_open(app, groups, group.id) && shown.insert(group.id) {
             order.push(TimelineItem::Group(group.id));
@@ -1011,16 +1061,37 @@ fn vertical_group_row(
     crate::ui_kit::disclosure(ui.painter(), centre, open, t.text_dim);
     // A folder whose features are all suppressed looks like a suppressed feature.
     let contents = folder_features(app, &[group.id]);
-    let suppressed = !contents.is_empty() && contents.iter().all(|id| app.session.doc.feature(*id).is_some_and(|f| f.suppressed));
+    let joints: Vec<_> = groups
+        .iter()
+        .filter(|candidate| candidate.id == group.id || group_is_descendant(groups, candidate.id, group.id))
+        .flat_map(|group| group.joints.iter())
+        .collect();
+    let suppressed = (!contents.is_empty() || !joints.is_empty())
+        && contents.iter().all(|id| app.session.doc.feature(*id).is_some_and(|f| f.suppressed))
+        && joints.iter().all(|id| app.session.doc.assembly.joints.iter().any(|joint| joint.id == **id && joint.suppressed));
     let mut painter = ui.painter().clone();
     if suppressed {
         painter.multiply_opacity(0.42);
     }
     let icon = Rect::from_center_size(pos2(rect.left() + 27.5 + offset, rect.center().y), vec2(17.0, 17.0));
-    icons::paint_icon(&painter, icon, "folder", f32::from(t.icon.a()) / 255.0);
+    icons::paint_icon(&painter, icon, "feature_group", f32::from(t.icon.a()) / 255.0);
     if suppressed {
         painter.line_segment([icon.left_bottom(), icon.right_top()], Stroke::new(1.5, t.text_dim));
     }
+    // Folded, it carries the worst mark of its features, as a feature chip marks its own (#8592).
+    let (status, tip) = if open { (None, None) } else { crate::timeline::worst_status(app, &contents) };
+    if let Some(status) = status {
+        let side = if names { t.space_12 } else { t.space_10 };
+        let at =
+            if names { pos2(rect.right() - t.space_3 - side, rect.center().y - side / 2.0) } else { icon.right_top() - vec2(side / 2.0, side / 2.0) };
+        let mark = Rect::from_min_size(at, vec2(side, side));
+        icons::paint_icon(ui.painter(), mark, status.icon(), 1.0);
+        crate::scenario::publish_handle(&format!("timeline-folder-status:{}:{}", status.icon(), group.name), mark.center());
+    }
+    let response = match tip {
+        Some(tip) => response.on_hover_text(tip),
+        None => response,
+    };
     let renaming = timeline_group_name(app, ui, group, rect, offset, names, suppressed, &t);
     crate::scenario::publish_handle(&format!("timeline-folder:{}", group.name), rect.center());
     let fold_rect = Rect::from_min_max(pos2(rect.left() + offset, rect.top()), pos2(rect.left() + offset + 18.0, rect.bottom()));
@@ -1057,6 +1128,23 @@ fn vertical_group_row(
         selection_actions(app, ui, groups);
     });
     open
+}
+
+fn folder_joint_rows(
+    app: &mut SolveApp,
+    ui: &mut egui::Ui,
+    group: &solidcraft_engine::doc::TimelineGroup,
+    groups: &[solidcraft_engine::doc::TimelineGroup],
+) {
+    if !group.joints.is_empty() && group_is_open(app, groups, group.id) {
+        ui.scope_builder(egui::UiBuilder::new().id_salt(("folder_joints", group.id)), |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                ui.add_space((group_depth(groups, group.id) + 1) as f32 * FOLDER_INDENT);
+                ui.vertical(|ui| crate::dialogs_assembly::timeline_joint_rows(app, ui, Some(&group.joints)));
+            });
+        });
+    }
 }
 
 /// The fold-arrow column of a history row. With sketches listed under their features every row
@@ -1096,6 +1184,8 @@ struct Rows<'a> {
     drag: Option<Drag>,
     hovered: Option<u64>,
     edit: Option<u64>,
+    /// Each sketch's solve state, read once for the column (#7245).
+    sketch_states: crate::sketch_state::SketchStates,
 }
 
 fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
@@ -1129,7 +1219,7 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
     let plan = drawn_rows(app, under_feature);
     let order = visible_order(app, &features, &groups, &plan);
     let first_indices: std::collections::BTreeMap<u64, Option<usize>> =
-        groups.iter().map(|group| (group.id, group_first_feature(&groups, &features, group.id))).collect();
+        groups.iter().map(|group| (group.id, group_position(&groups, &features, group.id))).collect();
     let end_indices: std::collections::BTreeMap<u64, usize> = groups
         .iter()
         .map(|group| (group.id, group_last_feature(&groups, &features, group.id).map_or(features.len(), |index| index.saturating_add(1))))
@@ -1137,6 +1227,7 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
     let from_view = [crate::timeline::hovered_feature(app), crate::timeline::picked_feature(app)];
     let drag_id = ui.id().with("tl_vertical_drag");
     let mut rows = Rows {
+        sketch_states: crate::sketch_state::SketchStates::of(app),
         names,
         under_feature,
         features: &features,
@@ -1161,7 +1252,7 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
     for (index, (id, ..)) in features.iter().enumerate() {
         let group_id = group_for(&groups, *id);
         let mut at_index: Vec<_> = groups.iter().filter(|group| first_indices.get(&group.id).copied().flatten() == Some(index)).collect();
-        at_index.sort_by_key(|group| (group_depth(&groups, group.id), group.id));
+        at_index.sort_by_key(|group| group_path(&groups, group.id));
         let marker_before_group = index == marker && !at_index.is_empty();
         if marker_before_group {
             let group = at_index.first().and_then(|group| group.parent);
@@ -1187,6 +1278,9 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
                     &mut slots,
                     &mut folder_drop_zones,
                 );
+                if group_first_feature(&groups, &features, group.id).is_none() {
+                    folder_joint_rows(app, ui, group, &groups);
+                }
                 rendered_group_header = true;
             }
         }
@@ -1197,17 +1291,20 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
             marker_y = vertical_marker(app, ui, &mut rows.drag);
         }
         // A sketch listed under a feature is drawn after that feature's row.
-        let Some(row) = plan.row_at(index) else { continue };
-        if !group_open {
-            continue;
+        if group_open && let Some(row) = plan.row_at(index) {
+            slots.push(VerticalSlot { y: ui.cursor().top(), position: row.slot.min(index), group: group_id, indent_group });
+            let indent = group_id.map(|id| (group_depth(&groups, id) + 1) as f32 * FOLDER_INDENT).unwrap_or(0.0);
+            feature_row(app, ui, &mut rows, index, indent, RowKind::Own);
+            previous_visible_group = group_id;
         }
-        slots.push(VerticalSlot { y: ui.cursor().top(), position: row.slot.min(index), group: group_id, indent_group });
-        let indent = group_id.map(|id| (group_depth(&groups, id) + 1) as f32 * FOLDER_INDENT).unwrap_or(0.0);
-        feature_row(app, ui, &mut rows, index, indent, RowKind::Own);
-        previous_visible_group = group_id;
+        let mut ending: Vec<_> = groups.iter().filter(|group| group_last_feature(&groups, &features, group.id) == Some(index)).collect();
+        ending.sort_by_key(|group| std::cmp::Reverse(group_depth(&groups, group.id)));
+        for group in ending {
+            folder_joint_rows(app, ui, group, &groups);
+        }
     }
     let mut trailing: Vec<_> = groups.iter().filter(|group| !shown_groups.contains(&group.id)).collect();
-    trailing.sort_by_key(|group| (first_indices.get(&group.id).copied().flatten().unwrap_or(usize::MAX), group_depth(&groups, group.id), group.id));
+    trailing.sort_by_key(|group| (first_indices.get(&group.id).copied().flatten().unwrap_or(usize::MAX), group_path(&groups, group.id)));
     for group in trailing {
         if group_ancestors_are_open(app, &groups, group.id) && shown_groups.insert(group.id) {
             vertical_group_row(
@@ -1225,6 +1322,7 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
                 &mut slots,
                 &mut folder_drop_zones,
             );
+            folder_joint_rows(app, ui, group, &groups);
         }
     }
     slots.push(VerticalSlot { y: ui.cursor().top(), position: n, group: None, indent_group: previous_visible_group });
@@ -1327,6 +1425,7 @@ fn feature_row(app: &mut SolveApp, ui: &mut egui::Ui, rows: &mut Rows, index: us
     let listed =
         (row_kind == RowKind::Own).then(|| plan.row_at(index)).flatten().map(|row| row.listed.as_slice()).filter(|listed| !listed.is_empty());
     let has_patterns = !reference && matches!(kind, TimelineKind::Sketch) && crate::sketch_pattern_tree::has_patterns(app, id);
+    let sketch_state = matches!(kind, TimelineKind::Sketch).then(|| rows.sketch_states.get(id)).flatten();
     // One fold per row: a feature's listed sketches, or a sketch's patterns.
     let fold = match listed {
         Some(_) => Some((sketches_key(id), false)),
@@ -1383,6 +1482,7 @@ fn feature_row(app: &mut SolveApp, ui: &mut egui::Ui, rows: &mut Rows, index: us
         error: error.is_some(),
         warning: warning.is_some(),
         reference,
+        ink: sketch_state.and_then(|state| state.ink(&t)),
         accent: crate::theme::TabAccent::for_tab(&t, if dragged { "SKETCH" } else { &app.ui.tab }),
     }
     .paint(ui.painter(), chip, style);
@@ -1416,6 +1516,9 @@ fn feature_row(app: &mut SolveApp, ui: &mut egui::Ui, rows: &mut Rows, index: us
         let mut tip = format!("{name} · {kind} · {summary}");
         if error.is_some() || warning.is_some() {
             tip.push_str(&format!("\n{}", crate::timeline::status_text(name, ty, error.as_deref(), warning.as_deref())));
+        }
+        if let Some(state) = sketch_state {
+            tip.push_str(&format!("\n{}", state.text()));
         }
         crate::ui_kit::text(ui, &tip, crate::ui_kit::Text::Value("history", false));
         // A value row is one line: where the sketch is listed gets a row of its own.
@@ -1680,6 +1783,7 @@ mod tests {
                     ("last", None),
                 ] {
                     h.step(&json!({"click":{"handle":format!("history:{control}")}})).unwrap();
+                    assert!(h.app.timeline_playback.is_none(), "navigation never starts playback");
                     h.settle();
                     assert_eq!(h.app.session.doc.marker, position, "{mode:?} {dock} {width}: {control}");
                     assert_eq!(h.app.session.model.state().bodies.len(), position.unwrap_or(3));
@@ -2228,10 +2332,10 @@ mod tests {
         let at_end = VerticalSlot { y: 60.0, position: 2, group: None, indent_group: Some(3) };
         let folder_rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 20.0));
         let groups = vec![
-            solidcraft_engine::doc::TimelineGroup { id: 1, name: "Outer".into(), parent: None, features: vec![] },
-            solidcraft_engine::doc::TimelineGroup { id: 2, name: "Middle".into(), parent: Some(1), features: vec![] },
-            solidcraft_engine::doc::TimelineGroup { id: 3, name: "Inner".into(), parent: Some(2), features: vec![] },
-            solidcraft_engine::doc::TimelineGroup { id: 7, name: "Target".into(), parent: None, features: vec![] },
+            solidcraft_engine::doc::TimelineGroup { id: 1, name: "Outer".into(), parent: None, features: vec![], joints: vec![] },
+            solidcraft_engine::doc::TimelineGroup { id: 2, name: "Middle".into(), parent: Some(1), features: vec![], joints: vec![] },
+            solidcraft_engine::doc::TimelineGroup { id: 3, name: "Inner".into(), parent: Some(2), features: vec![], joints: vec![] },
+            solidcraft_engine::doc::TimelineGroup { id: 7, name: "Target".into(), parent: None, features: vec![], joints: vec![] },
         ];
 
         assert_eq!(
@@ -2361,6 +2465,55 @@ mod tests {
         harness.frames(4);
     }
 
+    #[test]
+    fn joint_folder_rows_follow_their_nested_folder_before_its_sibling() {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.preferences.timeline_left = true;
+        h.app.run("sketch.create", json!({"plane":"XY", "name":"Profile"})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        h.app.run("component.create", json!({"name":"Part"})).unwrap();
+        for name in ["A", "B", "C"] {
+            h.app.run("joint.as_built", json!({"type":"rigid", "a":0, "b":"Part", "name":name})).unwrap();
+        }
+        let outer = h.app.run("timeline.group", json!({"name":"Outer", "features":["Profile"]})).unwrap()["group"].as_u64().unwrap();
+        let first = h.app.run("timeline.group", json!({"name":"First", "joints":["A"], "parent":outer})).unwrap()["group"].as_u64().unwrap();
+        h.app.run("timeline.group", json!({"name":"Second", "joints":["C"], "parent":outer})).unwrap();
+        h.app.run("timeline.group", json!({"name":"Nested", "joints":["B"], "parent":first})).unwrap();
+        h.frames(4);
+        let y = |name| handle_at(name).unwrap().y;
+        assert!(y("timeline-folder:First") < y("timeline-joint:A"));
+        assert!(y("timeline-joint:A") < y("timeline-folder:Nested"));
+        assert!(y("timeline-folder:Nested") < y("timeline-joint:B"));
+        assert!(y("timeline-joint:B") < y("timeline-folder:Second"));
+        assert!(y("timeline-folder:Second") < y("timeline-joint:C"));
+        h.app.tree.collapsed.insert(format!("timeline_group:{first}"));
+        h.frames(4);
+        assert!(handle_at("timeline-joint:A").is_none() && handle_at("timeline-joint:B").is_none());
+        assert!(handle_at("timeline-joint:C").is_some());
+    }
+
+    #[test]
+    fn joint_folder_menu_suppresses_and_deletes_joints_in_one_step() {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.preferences.timeline_left = true;
+        h.app.run("component.create", json!({"name":"Part"})).unwrap();
+        let joint = h.app.run("joint.as_built", json!({"type":"revolute", "a":0, "b":"Part", "name":"Hinge"})).unwrap()["joint"].as_u64().unwrap();
+        h.app.run("timeline.group", json!({"name":"Folder", "joints":[joint]})).unwrap();
+        h.frames(4);
+        folder_menu(&mut h, "Folder", "Suppress Selected Folders");
+        assert!(h.app.session.doc.assembly.joints[0].suppressed);
+        folder_menu(&mut h, "Folder", "Unsuppress Selected Folders");
+        assert!(!h.app.session.doc.assembly.joints[0].suppressed);
+        let before = h.app.session.doc.clone();
+        folder_menu(&mut h, "Folder", "Delete Folders and Features…");
+        assert!(h.app.session.doc.assembly.joints.is_empty());
+        assert!(h.app.session.doc.timeline_groups.is_empty());
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(*h.app.session.doc, *before);
+    }
+
     /// A folder's menu suppresses and unsuppresses every feature in it and in its nested folders,
     /// and deletes the folders with their features in one undo step (#7219).
     #[test]
@@ -2426,6 +2579,41 @@ mod tests {
         harness.step(&json!({"click": {"handle": "timeline-folder-fold:Folder"}})).unwrap();
         assert!(handle_at("timeline-folder:Folder").is_some(), "collapsed folder row disappeared");
         assert!(handle_at("timeline:Inside").is_none(), "collapsed folder still showed its contents");
+    }
+
+    /// #8592: a folded folder carries the worst mark of its features, nested folders included,
+    /// and an open one none.
+    #[test]
+    fn a_folded_folder_carries_the_worst_mark_of_its_features() {
+        let mut harness = Harness::new();
+        harness.app.preferences.timeline_left = true;
+        for name in ["Warned", "Broken"] {
+            harness.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10, "name": name})).unwrap();
+        }
+        harness.app.run("timeline.group", json!({"name": "Inner", "features": ["Broken"]})).unwrap();
+        harness.app.run("timeline.group", json!({"name": "Outer", "features": ["Warned"]})).unwrap();
+        let groups = harness.app.session.doc.timeline_groups.clone();
+        let id = |name: &str| groups.iter().find(|group| group.name == name).map(|group| group.id).unwrap();
+        harness.app.run("timeline.move_to_group", json!({"groups": [id("Inner")], "group": id("Outer")})).unwrap();
+        harness.frames(4);
+        let mark = |harness: &mut Harness, name: &str, error: Option<&str>, warning: Option<&str>| {
+            let feature = harness.app.session.doc.features.iter().find(|f| f.name == name).map(|f| f.id).unwrap();
+            let result = harness.app.session.model.results.iter_mut().find(|r| r.id == feature).unwrap();
+            result.error = error.map(str::to_string);
+            result.warning = warning.map(str::to_string);
+        };
+        mark(&mut harness, "Warned", None, Some("edge 3 no longer exists; using the edge at the picked point"));
+        harness.frames(2);
+        let marks = || crate::scenario::handles("timeline-folder-status:").into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+        assert!(marks().is_empty(), "open folders show their features' own marks");
+
+        harness.app.tree.collapsed.insert(format!("timeline_group:{}", id("Outer")));
+        harness.frames(2);
+        assert_eq!(marks(), ["timeline-folder-status:warning:Outer"]);
+
+        mark(&mut harness, "Broken", Some("the blend is larger than the neighbouring faces"), None);
+        harness.frames(2);
+        assert_eq!(marks(), ["timeline-folder-status:error:Outer"], "an error in a nested folder outweighs the warning");
     }
 
     #[test]
