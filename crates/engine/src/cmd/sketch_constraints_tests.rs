@@ -1232,6 +1232,94 @@ fn coincident_refuses_a_lines_two_ends() {
     run(&mut s, "sketch.constraint.coincident", json!({"a":"l1.end","b":"l2.end"}));
 }
 
+/// A constraint whose solve finds only a far solution is not allowed to throw points far away:
+/// the held solve is tried without it, or the constraint is refused. Here a centre that is
+/// already the midpoint of two lines is made the midpoint of a third, and the solve threw two
+/// line ends to x = -2.2e8 mm while the sketch said solved (found by a local sketch fuzzer).
+#[test]
+fn a_constraint_never_throws_the_sketch_far_away() {
+    let mut s = Session::default();
+    for (id, p) in [
+        ("sketch.create", json!({"plane": "XY"})),
+        ("sketch.arc.three_point", json!({"end": [-15, 6], "start": [-24, -21], "through": [-12, -1]})),
+        ("sketch.arc.three_point", json!({"end": [-18, -27], "start": [3, 13], "through": [22, 21]})),
+        ("sketch.dimension", json!({"entities": ["a1.start", "a2.center"], "value": 29})),
+        ("sketch.dimension", json!({"entities": ["a2.end", "a1.start"], "value": 38})),
+        ("sketch.circle.center", json!({"center": [-23, -10], "radius": 7})),
+        ("sketch.constraint.coincident", json!({"a": "a2.start", "b": "a1.end"})),
+        ("sketch.rectangle.two_point", json!({"p0": [22, -9], "p1": [19, -10]})),
+        ("sketch.line", json!({"ids": ["l16"], "points": [[-14, -29], [-5, 5]]})),
+        ("sketch.circle.center", json!({"center": [-14, 19], "radius": 14})),
+        ("sketch.constraint.fix", json!({"entity": "c1.center"})),
+        ("sketch.rectangle.two_point", json!({"p0": [-10, 23], "p1": [16, 13]})),
+        ("sketch.line", json!({"ids": ["l22"], "points": [[-8, 21], [25, 14]]})),
+        ("sketch.circle.center", json!({"center": [6, 10], "radius": 10})),
+        ("sketch.circle.center", json!({"center": [8, -12], "radius": 11})),
+        ("sketch.rectangle.two_point", json!({"p0": [-4, -7], "p1": [-5, -27]})),
+        ("sketch.constraint.concentric", json!({"a": "a1", "b": "c4"})),
+        ("sketch.rectangle.two_point", json!({"p0": [-12, -14], "p1": [-1, -17]})),
+        ("sketch.constraint.midpoint", json!({"line": "l12", "point": "c4.center"})),
+        ("sketch.constraint.midpoint", json!({"line": "l14", "point": "c4.center"})),
+        ("sketch.rectangle.two_point", json!({"p0": [23, 22], "p1": [-28, 8]})),
+        ("sketch.constraint.fix", json!({"entity": "p15"})),
+        ("sketch.dimension", json!({"entities": ["p17", "a1.start"], "value": 35})),
+        ("sketch.constraint.coincident", json!({"a": "p19", "b": "p12"})),
+        ("sketch.constraint.tangent", json!({"a": "c1", "b": "l11"})),
+        ("sketch.line", json!({"closed": true, "points": [[8, -29], [-5, 24], [-9, -6], [26, -8]]})),
+        ("sketch.constraint.perpendicular", json!({"a": "l15", "b": "l17"})),
+        ("sketch.dimension", json!({"entities": ["l12"], "value": 13})),
+        ("sketch.dimension", json!({"entities": ["l26", "l17"], "type": "angle", "value": 14})),
+        ("sketch.constraint.fix", json!({"entity": "p18"})),
+        ("sketch.constraint.tangent", json!({"a": "l23", "b": "c4"})),
+        ("sketch.constraint.coincident", json!({"a": "origin", "b": "l23.start"})),
+        ("sketch.constraint.midpoint", json!({"line": "l18", "point": "c4.center"})),
+    ] {
+        let _ = s.execute(id, &p);
+    }
+    let sk = sketch(&s);
+    let far = sk.points.iter().map(|p| p.pos.len()).fold(0.0_f64, f64::max);
+    assert!(far < 1e4, "a point went {far} mm away");
+}
+
+/// A constraint that can only be met by shrinking curves to a point is refused, as one that
+/// throws the sketch far away is: making a rectangle's corner the midpoint of the opposite side,
+/// or two opposite corners coincident, squeezed the whole rectangle to a point while the sketch
+/// said solved (found by a local sketch fuzzer).
+#[test]
+fn a_constraint_that_would_shrink_a_rectangle_to_a_point_is_refused() {
+    for (id, p) in
+        [("sketch.constraint.midpoint", json!({"line": "l4", "point": "p2"})), ("sketch.constraint.coincident", json!({"a": "p1", "b": "p3"}))]
+    {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-30, 4], "p1": [11, 27]}));
+        let before = sketch(&s);
+        let e = s.execute(id, &p).unwrap_err().to_string();
+        assert!(e.contains("shrink") && e.contains("to a point"), "{id} {p}: {e}");
+        assert_eq!(sketch(&s), before, "{id} {p}");
+    }
+}
+
+/// Two rectangles, a corner of one made coincident with a corner of the other and then a second
+/// pair of corners made coincident: one solve squeezed a 49 mm side to about 1.2e-6 mm, just
+/// longer than the check took for a point, and the next took it the rest of the way, so the
+/// constraint was taken (found by a local sketch fuzzer).
+#[test]
+fn a_constraint_that_squeezes_a_side_to_a_hair_is_refused() {
+    let mut s = new_sketch();
+    for (id, p) in [
+        ("sketch.rectangle.two_point", json!({"p0": [27, 29], "p1": [1, 19]})),
+        ("sketch.rectangle.two_point", json!({"p0": [23, -8], "p1": [-21, -20]})),
+        ("sketch.constraint.perpendicular", json!({"a": "l5", "b": "l4"})),
+        ("sketch.constraint.coincident", json!({"a": "p5", "b": "p1"})),
+    ] {
+        run(&mut s, id, p);
+    }
+    let before = sketch(&s);
+    let e = s.execute("sketch.constraint.coincident", &json!({"a": "p6", "b": "p3"})).unwrap_err().to_string();
+    assert!(e.contains("shrink") && e.contains("to a point"), "{e}");
+    assert_eq!(sketch(&s), before);
+}
+
 #[test]
 fn coincident_circles_lie_on_each_other() {
     let mut s = new_sketch();

@@ -259,7 +259,9 @@ it where it is), and it moves.
 `joint.drive` answers the joint's values as `joint.list` gives them, in degrees and millimetres
 with their units and limits, and `moved` says whether any part moved. A joint's origins are mated
 by default: B's z axis is turned against A's, as two faces meet. `flip: true` lines them up
-instead, so two origins given at one point with the same z stay as they are. Without an
+instead, so two origins given at one point with the same z and x stay as they are. A point origin
+without `x` takes its x from z alone, so a part turned about z turns back when it is joined: give
+`x` on both origins, or use `joint.as_built`, to keep it where it is. Without an
 `angle`, a new joint (other than a relation, which starts where its parts are) takes no turn or a half turn about its axis, whichever turns B less: two
 faces that already meet, a plate under a panel, stay as they are instead of B spinning about
 their shared normal. For scripts that drive many steps, `quiet: true` leaves the per-part
@@ -373,7 +375,12 @@ leaves the design as it was unless `apply` is true.
 
 **Insert Design** (`component.insert_design {path, translate?}`, on the **ASSEMBLE** panel and
 in the **File** menu) adds a component linked to another saved design, so each part can live in
-its own document. A STEP or mesh file picked there is inserted as **Insert STEP** or **Insert
+its own document. When other designs are open in tabs, the button first lists them under
+**Open designs**. One click inserts that design; a design not saved yet is greyed out, as it has no
+file to link; one with unsaved changes inserts its saved file, and the status line says so.
+**Browse…** at the end opens the file picker, as the button does when no other design is open.
+Preferences › Design › **Insert Design lists the designs open in other tabs first** turns the list
+off. A STEP or mesh file picked there is inserted as **Insert STEP** or **Insert
 Mesh** would. The part's solid bodies come
 in as they sit in that design, and they are kept in the assembly, so it opens even without the
 part file. The link is stored relative to the assembly's folder once the assembly is saved.
@@ -460,6 +467,8 @@ description; **Change Part Size** renumbers them, keeping a field you changed yo
   under it as `children` (items 1.1, 1.2…, with `each` per bolt and `count` in all) instead of
   rows of their own. Bolts with different contents (one with a nut, one without) are different
   rows. `total_occurrences` counts the children too, so it is the same either way.
+  For an inseparable part, only its purchased descendants become children; a purchased part
+  still has no children listed. Parts without a part number are not grouped this way.
 - `component` lists one subassembly's parts instead of the design's.
 
 A component's **bill of materials type** (`bom_type`, a part property set with

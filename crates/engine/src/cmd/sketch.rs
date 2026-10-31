@@ -128,7 +128,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!("p0, p1: overall ends, width", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.point", "Point", draw_point).at("SKETCH", "CREATE").icon("point").enabled(in_sketch).params(concat!("point: [x,y] (each a number or an expression over the design's parameters: the point is then fixed where it comes to and follows them) or a snap: \"mid:<line>\" (held at the line's midpoint), \"on:<curve>:x,y\" (on the curve near x,y), {vertex: [x,y,z]} or {on_edge: [x,y,z]} of the model; id?", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.dimension", "Sketch Dimension", dimension).at("SKETCH", "CREATE").icon("dimension").key("D").enabled(in_sketch).params(
-        "entities: [refs] (a line midpoint is \"mid:line_id\"), type?: auto|distance|horizontal|distance_x|vertical|distance_y|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override), or `name = expression` (e.g. \"width = 40\"; also `#name = expression`), which adds the user parameter `name` with that expression and dimensions with `name` (refused when the name is taken or reserved; the reply's `defined` names it); text_at?: [x, y]. Two points, two midpoints or a line off the axes: with auto, text_at inside the box they span (as opposite corners) or in its outer corners is the distance between them, above or below the box horizontal, beside it vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A line and a circle or arc: the distance from the line to its edge (the gap, or how far the edge reaches past a line that cuts it; 0 is tangent); dimension the centre point for the distance to the centre. A point and a circle or arc: the distance from the point to its edge (or how far within it a point inside lies). Two circles or arcs: the gap between their edges (or how far they overlap when they cross, or the narrowest gap between them when one lies inside the other), or the centre-to-centre distance when they are the two caps of a slot. An arc and one of its end points: the arc's length (type arc_length does it from the arc alone). A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. scale_sketch?: bool (the dimension tool sends true): when this is the sketch's first length dimension and nothing in the sketch fixes a size (no other driving length dimension, nothing fixed or projected), the whole sketch scales about its origin to the value instead of distorting. Returns measured in unit (mm or deg), and scaled: the factor when the sketch was scaled",
+        "entities: [refs] (a line midpoint is \"mid:line_id\"; a model edge or vertex, {edge: [x,y,z], body?} or {vertex: [x,y,z], body?}, is projected into the sketch first and measured there: a point against the projected edge measures the distance to it), type?: auto|distance|horizontal|distance_x|vertical|distance_y|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override), or `name = expression` (e.g. \"width = 40\"; also `#name = expression`), which adds the user parameter `name` with that expression and dimensions with `name` (refused when the name is taken or reserved; the reply's `defined` names it); text_at?: [x, y]. Two points, two midpoints or a line off the axes: with auto, text_at inside the box they span (as opposite corners) or in its outer corners is the distance between them, above or below the box horizontal, beside it vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A line and a circle or arc: the distance from the line to its edge (the gap, or how far the edge reaches past a line that cuts it; 0 is tangent); dimension the centre point for the distance to the centre. A point and a circle or arc: the distance from the point to its edge (or how far within it a point inside lies). Two circles or arcs: the gap between their edges (or how far they overlap when they cross, or the narrowest gap between them when one lies inside the other), or the centre-to-centre distance when they are the two caps of a slot. An arc and one of its end points: the arc's length (type arc_length does it from the arc alone). A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. scale_sketch?: bool (the dimension tool sends true): when this is the sketch's first length dimension and nothing in the sketch fixes a size (no other driving length dimension, nothing fixed or projected), the whole sketch scales about its origin to the value instead of distorting. Returns measured in unit (mm or deg), and scaled: the factor when the sketch was scaled",
     ),
     CommandSpec::new("sketch.constraint.horizontal_vertical", "Horizontal/Vertical", c_horizontal_vertical)
         .at("SKETCH", "CONSTRAINTS")
@@ -333,10 +333,76 @@ fn settle(strict: bool, rep: SolveReport, sk: &mut Sketch, unsolved: Sketch) -> 
     if strict && !rep.keeps_orientation() {
         return Err(EngineError::Other(rep.failure(|f| format!("that would over-constrain the sketch (conflicts with {f})"))));
     }
-    if !rep.keeps_orientation() {
+    // A solve that throws points far beyond the sketch found a far solution of its constraints,
+    // not the one the edit means (a line squeezed to a point under a direction constraint, an
+    // angle between sides that can't take it): it counts as one that fails.
+    let far = flung(&unsolved, sk);
+    if strict && far {
+        return Err(EngineError::Other(
+            "that would throw points of the sketch far away: its constraints have no solution near the sketch as it is".into(),
+        ));
+    }
+    // A solve that shrinks a line or circle to a point met its constraints only by squeezing
+    // that curve away (a corner made the midpoint of the opposite side of its rectangle).
+    let gone = shrunk(&unsolved, sk);
+    if strict && let Some(curve) = &gone {
+        return Err(EngineError::Other(format!("that would shrink {curve} to a point: its constraints can only be met without it")));
+    }
+    if !rep.keeps_orientation() || far || gone.is_some() {
         *sk = unsolved;
     }
     Ok(rep)
+}
+
+/// The first line or circle that solving `before` into `after` shrank to a point: longer (or
+/// wider) than 1e-3 before and shorter than 1e-5 after. A length a dimension asks for is never
+/// that short. 1e-6 let a side squeezed to 1.2e-6 by one solve through, and the next solve
+/// took it the rest of the way.
+fn shrunk(before: &Sketch, after: &Sketch) -> Option<String> {
+    let size = |sk: &Sketch, i: usize| match sk.curves.get(i).map(|c| &c.kind) {
+        Some(CurveKind::Line { .. }) => line_pts(sk, i).map(|(a, b)| a.dist(b)),
+        Some(CurveKind::Arc { .. } | CurveKind::Circle { .. }) => sk.radius(i),
+        _ => None,
+    };
+    (0..before.curves.len().min(after.curves.len()))
+        .find(|&i| matches!((size(before, i), size(after, i)), (Some(b), Some(a)) if b > 1e-3 && a < 1e-5))
+        .and_then(|i| after.curves.get(i).map(|c| c.id.clone()))
+}
+
+/// A solve moving some point further than this many times the sketch's size (and its largest
+/// dimension value) has thrown the geometry to a far solution.
+const FLUNG: f64 = 1000.0;
+
+/// Why a solve from `before` into `after` collapses the sketch, in the words `settle` uses to
+/// refuse an edit's solve: a line or circle shrunk to a point, or points thrown far away.
+/// `None` when the solved shape is one the edit can mean. Value edits (`Session::settle_value_edit`)
+/// run the same checks, so a parameter, a configuration row or the dimension editor cannot
+/// store a sketch whose curve has been squeezed away and which can never be solved back.
+pub(crate) fn collapse_reason(before: &Sketch, after: &Sketch) -> Option<String> {
+    if let Some(curve) = shrunk(before, after) {
+        return Some(format!("that would shrink {curve} to a point: its constraints can only be met without it"));
+    }
+    if flung(before, after) {
+        return Some("that would throw points of the sketch far away: its constraints have no solution near the sketch as it is".into());
+    }
+    None
+}
+
+/// Did solving `before` into `after` throw some point further than [`FLUNG`] times the sketch's
+/// size, or to no number at all?
+fn flung(before: &Sketch, after: &Sketch) -> bool {
+    let (lo, hi) = before
+        .points
+        .iter()
+        .map(|p| p.pos)
+        .filter(|p| p.x.is_finite() && p.y.is_finite())
+        .fold((Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(lo, hi), p| {
+            (Vec2::new(lo.x.min(p.x), lo.y.min(p.y)), Vec2::new(hi.x.max(p.x), hi.y.max(p.y)))
+        });
+    let size = if lo.x <= hi.x { lo.dist(hi) } else { 0.0 };
+    let longest = after.driving_values().values().map(|v| v.abs()).filter(|v| v.is_finite()).fold(0.0, f64::max);
+    let reach = FLUNG * (size + longest).max(1.0);
+    after.points.iter().zip(&before.points).any(|(a, b)| !(a.pos.dist(b.pos) <= reach))
 }
 
 /// The sketch solves of `edit` and drags, counted in tests (see [`solve_with`]).
@@ -905,6 +971,20 @@ fn finish_sketch(s: &mut Session, _p: &Value) -> Result<Value> {
 // ---------------------------------------------------------------------------------------------
 // Drawing
 
+/// The id a drawing command gives its geometry, checked against the names that geometry
+/// will carry: a curve's id goes into the name of the faces the curve makes
+/// (`F2:side:<id>`), and a name reads some characters as its own. An id holding one of
+/// them would split every name it lands in, so it is refused here (#5858).
+fn named_id(cmd: &str, id: Option<&str>) -> Result<Option<String>> {
+    match id {
+        Some(i) if !solidcraft_doc::persistent_name::text_fits_name(i) => {
+            Err(bad(cmd, format!("the id `{i}` cannot be written into a name whole; give an id without `|`, `,`, `~`, `#` or `]`")))
+        }
+        Some(i) => Ok(Some(i.to_string())),
+        None => Ok(None),
+    }
+}
+
 fn draw_line(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.line";
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
@@ -915,6 +995,9 @@ fn draw_line(s: &mut Session, p: &Value) -> Result<Value> {
     let closed = bool_(p, "closed").unwrap_or(false);
     let infer = bool_(p, "infer").unwrap_or(false);
     let ids = string_list(cmd, p, "ids")?;
+    for id in &ids {
+        named_id(cmd, Some(id))?;
+    }
     let ((curves, cons), info) = draw(s, p, cmd, |sk, doc| {
         let args: Vec<PArg> = list.iter().map(|v| parg(sk, doc, v, cmd)).collect::<Result<_>>()?;
         let n = args.len();
@@ -1257,7 +1340,7 @@ fn circle_center(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.circle.center";
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
     let r = radius_arg(p, cmd)?;
-    let id = str_(p, "id").map(str::to_string);
+    let id = named_id(cmd, str_(p, "id"))?;
     let (out, info) = draw(s, p, cmd, |sk, doc| {
         let c = req_parg(sk, doc, p, "center", cmd)?;
         // The origin is the sketch's frame, not a hold on the geometry: a circle centred there
@@ -1324,7 +1407,7 @@ fn circle_three(s: &mut Session, p: &Value) -> Result<Value> {
 fn arc_three(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.arc.three_point";
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
-    let id = str_(p, "id").map(str::to_string);
+    let id = named_id(cmd, str_(p, "id"))?;
     let (out, info) = draw(s, p, cmd, |sk, doc| {
         let (a, b) = (req_parg(sk, doc, p, "start", cmd)?, req_parg(sk, doc, p, "end", cmd)?);
         let t = req_parg(sk, doc, p, "through", cmd)?;
@@ -1351,7 +1434,7 @@ fn arc_three(s: &mut Session, p: &Value) -> Result<Value> {
 fn arc_center(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.arc.center_point";
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
-    let id = str_(p, "id").map(str::to_string);
+    let id = named_id(cmd, str_(p, "id"))?;
     let sweep = num(p, "sweep");
     let (out, info) = draw(s, p, cmd, |sk, doc| {
         let c = req_parg(sk, doc, p, "center", cmd)?;
@@ -1546,7 +1629,7 @@ fn slot_overall(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn draw_point(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.point";
-    let id = str_(p, "id").map(str::to_string);
+    let id = named_id(cmd, str_(p, "id"))?;
     // A point snapped while drawing (`"mid:<line>"`, `"on:<curve>:x,y"`, a model vertex or edge):
     // the snap makes it, held by its constraint, as it does for a line's end. Taken as bare
     // coordinates it was free to move off the midpoint it was put on (#4691).
@@ -1736,7 +1819,7 @@ pub(super) fn apply_in_order(sk: &mut Sketch, rep: &SolveReport, first: &[Ent], 
         }));
         let ok = solve_with(&mut trial, &h, None, Analysis::StatusOnly, None).ok();
         trial.constraints.retain(|c| c.id != TEMP);
-        if ok && !collapsed(sk, &trial) {
+        if ok && !collapsed(sk, &trial) && !flung(sk, &trial) {
             *sk = trial;
             return Ok(());
         }
@@ -1748,6 +1831,12 @@ pub(super) fn apply_in_order(sk: &mut Sketch, rep: &SolveReport, first: &[Ent], 
     if first_movable && !second_locked {
         let mut trial = sk.clone();
         if solve_with(&mut trial, &Hold::default(), None, Analysis::StatusOnly, None).ok() {
+            if flung(sk, &trial) {
+                return Err(bad(cmd, "that would throw points of the sketch far away: its constraints have no solution near the sketch as it is"));
+            }
+            if let Some(curve) = shrunk(sk, &trial) {
+                return Err(bad(cmd, format!("that would shrink {curve} to a point: its constraints can only be met without it")));
+            }
             *sk = trial;
             return Ok(());
         }
@@ -2435,6 +2524,10 @@ pub(super) fn line_pts(sk: &Sketch, l: usize) -> Option<(Vec2, Vec2)> {
 
 fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.dimension";
+    // A dimension may measure model geometry (#7912): an `{edge: [x,y,z], body?}` or a
+    // `{vertex: [x,y,z], body?}` among its entities is projected into the sketch first, as
+    // `sketch.project` does, and stands for the projected curve (or point) there.
+    let p = &super::sketch_project::project_entities(s, p, cmd)?;
     let ents = string_list(cmd, p, "entities")?;
     if ents.is_empty() || ents.len() > 2 {
         return Err(bad(cmd, "`entities` must list one or two sketch entities"));

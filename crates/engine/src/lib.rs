@@ -33,6 +33,8 @@ pub mod slicer_files;
 mod slicer_icon;
 pub mod slicers;
 pub mod snap;
+pub mod status_details;
+pub mod status_items;
 pub mod timing;
 pub mod view;
 
@@ -43,6 +45,7 @@ use serde_json::Value;
 use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
+pub use cmd::settings::{MAX_PROFILE_NAME, profile_name};
 pub use cmd::{
     Addition, CommandInfo, CommandSpec, addition, auto_operation, command_specs, dimension_roles, extrude_reach, find_command, resolve_design_links,
     shown_scope, standard_view,
@@ -173,6 +176,18 @@ pub enum Sel {
     },
 }
 
+impl Sel {
+    /// The body this item names, when it names one: the body itself, or the body a face, edge
+    /// or vertex belongs to. Session state that names a body has to follow its renames (#9737).
+    pub(crate) fn body_name(&self) -> Option<&str> {
+        match self {
+            Sel::Body { name } => Some(name),
+            Sel::Face { body, .. } | Sel::Edge { body, .. } | Sel::Vertex { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+}
+
 /// A body rename between two designs (see `Session::body_renames`).
 #[derive(Clone)]
 struct BodyRename {
@@ -181,6 +196,71 @@ struct BodyRename {
     old: String,
     new: String,
     names_only: bool,
+}
+
+/// Bodies, component placements or timeline features copied in one design, for pasting into another:
+/// that design's model as it was when they were copied,
+/// so the copy is what was copied, whatever happens to that design (or its tab) after.
+#[derive(Clone, Debug)]
+pub struct ForeignCopy {
+    /// The design's name (it names what the paste adds).
+    pub design: String,
+    /// Timeline features, in their original order (`timeline.paste` with `from_design`).
+    pub features: Vec<solidcraft_doc::Feature>,
+    /// Its placed model: what its Browser and view showed.
+    pub world: Arc<solidcraft_doc::ModelState>,
+    /// The bodies copied, as its Browser names them (a body seen in another placement under the
+    /// name it has there).
+    pub bodies: Vec<String>,
+    /// The name each of `bodies` has in its component (without the placement a body seen in
+    /// another placement is named after): the name it pastes as.
+    pub names: Vec<String>,
+    /// The component placements copied, by path.
+    pub placements: Vec<Vec<u64>>,
+    /// Each of `placements`: the component placed, the occurrence and where it is in the world.
+    pub placed: Vec<(u64, u64, solidcraft_doc::Mat)>,
+    /// The design, its evaluated model and its placements moved but not yet applied: what a
+    /// pasted component's history is copied from.
+    pub doc: Arc<Document>,
+    pub model: Model,
+    pub pending_moves: std::collections::BTreeMap<u64, solidcraft_doc::Mat>,
+}
+
+impl ForeignCopy {
+    /// What `session` copies when `bodies` and `placements` are copied in it now.
+    pub fn of(session: &Session, bodies: Vec<String>, placements: Vec<Vec<u64>>) -> ForeignCopy {
+        let frames = session.placed_document().body_frames_with_source(&session.model.state());
+        let names = bodies.iter().map(|b| frames.iter().find(|f| f.0 == *b).map_or_else(|| b.clone(), |f| f.1.clone())).collect();
+        let placed = placements.iter().filter_map(|p| session.occurrence_placement(p).ok()).map(|p| (p.component, p.occurrence, p.world)).collect();
+        ForeignCopy {
+            design: session.doc.name.clone(),
+            features: Vec::new(),
+            world: session.world_state(),
+            bodies,
+            names,
+            placements,
+            placed,
+            doc: session.doc.clone(),
+            model: session.model.clone(),
+            pending_moves: session.pending_moves.clone(),
+        }
+    }
+
+    /// Timeline Copy's snapshot. No placed body geometry is needed to paste sketches.
+    pub fn of_features(session: &Session) -> ForeignCopy {
+        ForeignCopy {
+            design: session.doc.name.clone(),
+            features: session.clipboard.clone(),
+            world: session.model.state(),
+            bodies: Vec::new(),
+            names: Vec::new(),
+            placements: Vec::new(),
+            placed: Vec::new(),
+            doc: session.doc.clone(),
+            model: session.model.clone(),
+            pending_moves: session.pending_moves.clone(),
+        }
+    }
 }
 
 /// One undo step.
@@ -364,6 +444,8 @@ pub struct Session {
     /// Revision increments caused only by visibility. Comparing both counters proves that
     /// every intervening increment left an editor's document and model untouched.
     visibility_revision: u64,
+    /// [`Document::browser_stamp`] when the browser's groups and order were last checked.
+    browser_stamp: [u64; 6],
     /// This open design's id for programs that follow it (`document.revision`, #6646): kept
     /// while it stays open, through saves and renames; another for each design started or opened.
     pub document_id: String,
@@ -392,6 +474,10 @@ pub struct Session {
     /// (see [`Session::solve_joints`]).
     joints_settled: Option<(Arc<Document>, std::sync::Weak<solidcraft_doc::ModelState>)>,
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
+    /// The hidden joints and folders of the view, as sets: the browser asks about every joint
+    /// of the design on every frame (#3892), and an answer that walked the hidden lists made a
+    /// frame cost grow with the size of the design.
+    visibility_index_cache: std::sync::Mutex<Option<occurrences::VisibilityIndex>>,
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
     occurrence_bodies_cache: std::sync::Mutex<Option<occurrences::OccurrenceBodiesCache>>,
     placement_index_cache: std::sync::Mutex<Option<occurrences::PlacementIndex>>,
@@ -410,6 +496,9 @@ pub struct Session {
     pub sketch_clipboard: Option<cmd::sketch_clipboard::SketchClip>,
     /// Resolved appearance copied by appearance.copy; transient, outside design/history.
     pub appearance_clipboard: Option<solidcraft_doc::appearance::Look>,
+    /// What was copied in another design, to paste here (`component.paste_from_design`). The
+    /// host puts it here; each design's own copies stay in its own clipboard.
+    pub foreign_copy: Option<Arc<ForeignCopy>>,
     /// Section Analysis: a view cut by a plane (origin, unit normal; the normal side is hidden).
     pub section: Option<(Vec3, Vec3)>,
     /// Whether the section's cut faces are hatched (`inspect.section`'s `hatch`; on by default).
@@ -421,6 +510,12 @@ pub struct Session {
     /// The seams `inspect.continuity` last measured, for the viewport to shade. View state: not
     /// part of the design and not an undo step.
     pub continuity: Vec<ContinuitySeam>,
+    /// Oldest active slot first; replacing an effect retains its row position.
+    status_order: Vec<status_items::StatusId>,
+    /// Successful source activations, independently of row order and sharing policy.
+    status_activation: Vec<status_items::StatusId>,
+    single_surface_analysis: bool,
+    latest_analysis: Option<status_items::StatusId>,
     /// What is hidden or shown in the view (`browser.visibility`): saved with the design and an
     /// undo step of its own ([`Snapshot::visibility`]). A design brings its saved visibility when
     /// it opens (`Session::new`).
@@ -503,6 +598,8 @@ pub struct ContinuitySeam {
     pub points: Vec<Vec3>,
     /// The seam's worst verdict along its length.
     pub verdict: kernel::SeamVerdict,
+    /// Successful measurement settings and diagnostics, owned by this particular seam.
+    pub details: status_details::ContinuityDetail,
 }
 
 impl SurfaceAnalysis {
@@ -573,6 +670,7 @@ impl Session {
             log: Vec::new(),
             revision: 1,
             visibility_revision: 0,
+            browser_stamp: [0; 6],
             document_id: cmd::inspect::new_document_id(),
             followed: None,
             auto_project: true,
@@ -585,6 +683,7 @@ impl Session {
             world_cache: Default::default(),
             joints_settled: None,
             occurrence_visibility_cache: Default::default(),
+            visibility_index_cache: Default::default(),
             removed_later_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
             placement_index_cache: Default::default(),
@@ -594,11 +693,16 @@ impl Session {
             clipboard: Vec::new(),
             sketch_clipboard: None,
             appearance_clipboard: None,
+            foreign_copy: None,
             section: None,
             section_hatch: true,
             colored_components: None,
             analysis: None,
             continuity: Vec::new(),
+            status_order: Vec::new(),
+            status_activation: Vec::new(),
+            single_surface_analysis: true,
+            latest_analysis: None,
             checkpoints: Vec::new(),
             next_checkpoint: 1,
             replacements: 0,
@@ -622,6 +726,7 @@ impl Session {
     /// checkpoint keeps, not the replaced session's file path (docs/mcp.md).
     pub fn replace_design(&mut self, fresh: Session) {
         let auto_project = self.auto_project;
+        let single_surface_analysis = self.single_surface_analysis;
         let param_check = self.param_check;
         let easyprint_upload = self.easyprint_upload.take();
         let render_viewport = self.render_viewport.clone();
@@ -635,6 +740,7 @@ impl Session {
         *self = fresh;
         self.crash_journal = crash_journal;
         self.auto_project = auto_project;
+        self.set_single_surface_analysis(single_surface_analysis);
         self.param_check = param_check;
         self.easyprint_upload = easyprint_upload;
         self.render_viewport = render_viewport;
@@ -863,6 +969,15 @@ impl Session {
         }
         self.revision += 1;
         self.prune_occurrence_state();
+        // Looked at only when what the groups can name has changed, not on every refresh.
+        let stamp = self.doc.browser_stamp();
+        if stamp != self.browser_stamp {
+            if let Some((groups, order)) = self.doc.browser_pruned() {
+                let d = self.doc_mut();
+                (d.browser_groups, d.browser_order) = (groups, order);
+            }
+            self.browser_stamp = self.doc.browser_stamp();
+        }
         // Joints follow the geometry their origins snap to.
         if !self.doc.assembly.joints.is_empty() {
             // A solve that moves parts changes what features reading where a part is placed
@@ -914,6 +1029,13 @@ impl Session {
         self.follow_axis_point_renames(previous);
         let rename = self.body_rename(previous);
         self.remap_hidden_bodies(previous, &self.model.state(), rename.as_ref().map(|(old, new, _)| (old.as_str(), new.as_str())));
+        // Locked bodies follow the rename here rather than in `body.rename`, so a rename that
+        // reaches the design any other way (undo, an outside edit) is covered too (#9737).
+        if let Some((old, new, _)) = &rename {
+            for b in self.visibility.locked_bodies.iter_mut().filter(|b| **b == *old) {
+                *b = new.clone();
+            }
+        }
         if let Some((old, new, names_only)) = rename
             && names_only
             && self.model.rename_body(&self.doc, &old, &new)
@@ -937,9 +1059,10 @@ impl Session {
     /// Pin the name of every body the features made, as if the body had been renamed to it, and
     /// reserve the `Body<N>` names, so that no later command renames a body or hands its number
     /// to another. It is part of the command that made the bodies. A design saved before names
-    /// were pinned is pinned by its first command that changes it, with the names it has after
-    /// that command: when that command is itself a delete, reorder, suppress or rollback, the
-    /// later counted bodies are renumbered once, as they always were.
+    /// were pinned is pinned as it opens ([`Self::opened_at`]), with the names it was saved
+    /// with; one made in memory ([`Self::new`]) by its first command that changes it, with the
+    /// names it has after that command (a delete, reorder, suppress or rollback renumbers the
+    /// later counted bodies once).
     fn pin_body_names(&mut self) {
         if self.model.is_stale() {
             return;
@@ -1042,14 +1165,15 @@ impl Session {
         }
     }
 
-    /// Only persistent render intent, part properties or appearances changed. Never evaluate or
-    /// clear a stale model here.
+    /// Only persistent render intent, part properties, appearances or the browser's groups changed.
+    /// Never evaluate or clear a stale model here.
     fn render_only_change(&self, before: &Snapshot) -> bool {
         self.active_sketch == before.active_sketch
             && self.pending_moves == before.pending_moves
             && (self.doc.differs_only_in_render(&before.doc)
                 || self.doc.differs_only_in_part_properties(&before.doc)
-                || self.doc.differs_only_in_appearance(&before.doc))
+                || self.doc.differs_only_in_appearance(&before.doc)
+                || self.doc.differs_only_in_browser(&before.doc))
     }
 
     /// Only what is hidden or shown changed (`browser.visibility`): the document and the model
@@ -1107,6 +1231,10 @@ impl Session {
     /// as before. Otherwise store each sketch whose values changed as solved, so the next edit
     /// continues from it (see `Model::adopt_solved_sketches`).
     pub(crate) fn settle_value_edit(&mut self, solved_before: &SketchValues) -> Result<()> {
+        // The solved geometry each sketch had before the edit, for the shrink/fling checks
+        // after the refresh below (the same checks `settle` runs on an edit's own solve).
+        let solved_geometry: std::collections::BTreeMap<u64, solidcraft_sketch::Sketch> =
+            self.model.results.iter().filter_map(|r| r.state.sketch(r.id).map(|k| (r.id, k.sketch.clone()))).collect();
         // Quantity changes alter topology, so store the regenerated instances in the same
         // transaction as the parameter edit. Later picks and undo must see those same ids.
         let mut updated: Vec<_> = self
@@ -1135,8 +1263,19 @@ impl Session {
         self.refresh();
         for r in &self.model.results {
             let (Some(before), Some(k)) = (solved_before.get(&r.id), r.state.sketch(r.id)) else { continue };
-            if !k.report.keeps_orientation() && own_values(&k.sketch) != *before {
+            if own_values(&k.sketch) == *before {
+                continue;
+            }
+            if !k.report.keeps_orientation() {
                 let why = k.report.failure(|f| format!("its constraints would conflict ({f})"));
+                return Err(EngineError::Other(format!("sketch `{}`: {why}; the values were not changed", r.name)));
+            }
+            // The value changed this sketch and it still solves: refuse it the way `settle`
+            // refuses an edit's solve when the curve was squeezed away or points thrown far,
+            // so a zero (or wild) value is never stored as a sketch that can't be solved back.
+            if let Some(before_sketch) = solved_geometry.get(&r.id)
+                && let Some(why) = cmd::collapse_reason(before_sketch, &k.sketch)
+            {
                 return Err(EngineError::Other(format!("sketch `{}`: {why}; the values were not changed", r.name)));
             }
         }
@@ -1362,8 +1501,13 @@ impl Session {
     /// Go back to checkpoint `id` as if nothing since had happened (the undo history too). It
     /// and later checkpoints are used up.
     pub fn restore_checkpoint(&mut self, id: u64) -> Result<()> {
-        let i = self.checkpoints.iter().position(|c| c.id == id).ok_or_else(|| EngineError::Other(format!("no checkpoint {id}")))?;
-        let Some(c) = self.checkpoints.drain(i..).next() else { return Err(EngineError::Other(format!("no checkpoint {id}"))) };
+        let missing = || {
+            EngineError::Other(format!(
+                "no checkpoint {id} (used up by restoring or forgetting it or an earlier one, or dropped: only the last {MAX_CHECKPOINTS} are kept)"
+            ))
+        };
+        let i = self.checkpoints.iter().position(|c| c.id == id).ok_or_else(missing)?;
+        let Some(c) = self.checkpoints.drain(i..).next() else { return Err(missing()) };
         let before = Snapshot {
             label: String::new(),
             doc: self.doc.clone(),
@@ -1416,6 +1560,7 @@ impl Session {
             log: Vec::new(),
             revision: self.revision,
             visibility_revision: self.visibility_revision,
+            browser_stamp: self.browser_stamp,
             document_id: self.document_id.clone(),
             followed: None,
             auto_project: self.auto_project,
@@ -1428,6 +1573,7 @@ impl Session {
             world_cache: std::sync::Mutex::new(self.world_cache.lock().ok().and_then(|cache| cache.clone())),
             joints_settled: self.joints_settled.clone(),
             occurrence_visibility_cache: Default::default(),
+            visibility_index_cache: Default::default(),
             removed_later_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
             placement_index_cache: Default::default(),
@@ -1437,11 +1583,16 @@ impl Session {
             clipboard: self.clipboard.clone(),
             sketch_clipboard: self.sketch_clipboard.clone(),
             appearance_clipboard: self.appearance_clipboard.clone(),
+            foreign_copy: self.foreign_copy.clone(),
             section: None,
             section_hatch: true,
             colored_components: None,
             analysis: None,
             continuity: Vec::new(),
+            status_order: Vec::new(),
+            status_activation: Vec::new(),
+            single_surface_analysis: self.single_surface_analysis,
+            latest_analysis: None,
             checkpoints: Vec::new(),
             next_checkpoint: 1,
             replacements: 0,
@@ -1744,9 +1895,10 @@ impl Session {
 
     /// [`Session::run_script`], timing each command (#1833): the results and
     /// `{"timings": [{"index", "command", "ms", "profile"?}], "total_ms"}`, with `profile` the
-    /// kernel's share of each command ([`timing`]).
-    pub fn run_script_timed(&mut self, script: &Value, profile: bool) -> Result<(Vec<Value>, Value)> {
-        let (results, timings) = self.run_script_with(script, Some(profile), &mut |_, _| {})?;
+    /// kernel's share of each command ([`timing`]). `each` is called as in
+    /// [`Session::run_script_each`].
+    pub fn run_script_timed(&mut self, script: &Value, profile: bool, each: &mut dyn FnMut(usize, &Value)) -> Result<(Vec<Value>, Value)> {
+        let (results, timings) = self.run_script_with(script, Some(profile), each)?;
         Ok((results, timings.unwrap_or(Value::Null)))
     }
 
@@ -1910,6 +2062,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         point_clouds,
         param_comments,
         materials,
+        print_faces,
         user_materials,
         appearances,
         body_components,
@@ -1945,6 +2098,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *point_clouds == b.point_clouds
         && *param_comments == b.param_comments
         && *materials == b.materials
+        && *print_faces == b.print_faces
         && *user_materials == b.user_materials
         && *appearances == b.appearances
         && *body_components == b.body_components

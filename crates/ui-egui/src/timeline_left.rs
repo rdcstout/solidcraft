@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::history_rows::{HistoryFeature, HistoryRows};
 use crate::theme::Tokens;
 use crate::timeline::{
-    TimelineKind, clipboard_buttons, delete_after_marker_button, delete_feature, delete_features, icon_of, message_button, selected_feature_ids,
+    TimelineKind, clipboard_buttons, delete_after_marker_button, delete_button, delete_features, icon_of, message_button, selected_feature_ids,
 };
 use crate::{SolveApp, icons};
 
@@ -568,8 +568,46 @@ fn vertical_marker(app: &mut SolveApp, ui: &mut egui::Ui, drag: &mut Option<Drag
     rect.center().y
 }
 
-fn group_for(groups: &[solidcraft_engine::doc::TimelineGroup], feature: u64) -> Option<u64> {
+pub(crate) fn group_for(groups: &[solidcraft_engine::doc::TimelineGroup], feature: u64) -> Option<u64> {
     groups.iter().find(|group| group.features.contains(&feature)).map(|group| group.id)
+}
+
+/// The features a drag starting on feature `id`'s row moves: the selection, with the row
+/// selected first when it isn't. Shared with the History in the browser (#9565).
+pub(crate) fn drag_features(app: &mut SolveApp, id: u64, selected: bool) -> Vec<u64> {
+    if !selected {
+        select_only(app, TimelineItem::Feature(id));
+    }
+    selected_feature_ids(app)
+}
+
+/// Drops dragged History items at timeline `position`, into folder `group` (`None`: the timeline
+/// root), before the history marker when `active`. Shared with the History in the browser (#9565).
+pub(crate) fn drop_items(
+    app: &mut SolveApp,
+    plan: &HistoryRows,
+    features: &[u64],
+    groups: &[u64],
+    group: Option<u64>,
+    position: usize,
+    active: bool,
+) {
+    let mut params = json!({"group": group, "position": position});
+    // A feature and the sketches listed under it move as one block (#6489); the move's own checks
+    // refuse a place where anything would fail.
+    let features = plan.with_listed(features);
+    if !features.is_empty() {
+        params["features"] = json!(features);
+    }
+    if !groups.is_empty() {
+        params["groups"] = json!(groups);
+    }
+    // Crossing the marker rolls the moved features back or forward, in the same step.
+    params["active"] = json!(active);
+    let _ = app.run("timeline.move_many", params);
+    if let Some(group) = group {
+        app.tree.collapsed.remove(&format!("timeline_group:{group}"));
+    }
 }
 
 fn selected_drag_items(app: &SolveApp, origin_x: f32, source_group: Option<u64>) -> DragItems {
@@ -671,7 +709,7 @@ fn select_item(app: &mut SolveApp, ui: &egui::Ui, item: TimelineItem, order: &[T
     }
 }
 
-fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft_engine::doc::TimelineGroup]) {
+fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft_engine::doc::TimelineGroup], feature_menu: bool) {
     let features = selected_feature_ids(app);
     let selected_groups = app.tree.picked_timeline_groups.clone();
     let has_selection = !features.is_empty() || !selected_groups.is_empty();
@@ -737,7 +775,9 @@ fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft
             ui.close();
         }
     }
-    if !features.is_empty() {
+    // A feature's menu has its own Delete, which deletes the selection ([`delete_button`]): a
+    // right-click on a feature outside the selection selects that feature first.
+    if !features.is_empty() && !feature_menu {
         ui.separator();
         if crate::context_menu::button(ui, "Delete Selected Features…", "delete").clicked() {
             delete_features(app, features);
@@ -1125,7 +1165,7 @@ fn vertical_group_row(
             ui.close();
         }
         ui.separator();
-        selection_actions(app, ui, groups);
+        selection_actions(app, ui, groups, false);
     });
     open
 }
@@ -1381,22 +1421,7 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
                     vertical_drop_group(pointer, slot, &folder_drop_zones, &groups, panel_left, drag_x(&items, pointer.x), items.source_group);
                 let valid_target = folder_target.is_none_or(|target| valid_folder_target(&items, &groups, target));
                 if valid_target {
-                    let mut params = json!({"group": folder_target, "position": slot.position});
-                    // A feature and the sketches listed under it move as one block (#6489); the
-                    // move's own checks refuse a place where anything would fail.
-                    let features = plan.with_listed(&items.features);
-                    if !features.is_empty() {
-                        params["features"] = json!(features);
-                    }
-                    if !items.groups.is_empty() {
-                        params["groups"] = json!(items.groups);
-                    }
-                    // Crossing the marker rolls the moved features back or forward, in the same step.
-                    params["active"] = json!(slot.y < marker_y);
-                    let _ = app.run("timeline.move_many", params);
-                    if let Some(group) = folder_target {
-                        app.tree.collapsed.remove(&format!("timeline_group:{group}"));
-                    }
+                    drop_items(app, &plan, &items.features, &items.groups, folder_target, slot.position, slot.y < marker_y);
                 }
             }
         }
@@ -1495,11 +1520,9 @@ fn feature_row(app: &mut SolveApp, ui: &mut egui::Ui, rows: &mut Rows, index: us
         rows.hovered = Some(id);
     }
     if response.drag_started() && !on_fold {
-        if !selected {
-            select_only(app, TimelineItem::Feature(id));
-        }
+        let features = drag_features(app, id, selected);
         let origin_x = drag_press_x(&response, rect.center().x);
-        rows.drag = Some(Drag::Items(selected_drag_items(app, origin_x, group_id)));
+        rows.drag = Some(Drag::Items(DragItems { features, ..selected_drag_items(app, origin_x, group_id) }));
     }
     let listed_under = plan.host(id).and_then(|host| features.iter().find(|feature| feature.0 == host)).map(|feature| feature.1.as_str());
     let mut tooltip = egui::Tooltip::for_enabled(&response);
@@ -1516,6 +1539,10 @@ fn feature_row(app: &mut SolveApp, ui: &mut egui::Ui, rows: &mut Rows, index: us
         let mut tip = format!("{name} · {kind} · {summary}");
         if error.is_some() || warning.is_some() {
             tip.push_str(&format!("\n{}", crate::timeline::status_text(name, ty, error.as_deref(), warning.as_deref())));
+        }
+        // Greyed out says only "not shown": say why (#8100).
+        if rolled {
+            tip.push_str(&format!("\n{}", crate::i18n::tr("timeline.feature_rolled_back")));
         }
         if let Some(state) = sketch_state {
             tip.push_str(&format!("\n{}", state.text()));
@@ -1570,13 +1597,10 @@ fn feature_row(app: &mut SolveApp, ui: &mut egui::Ui, rows: &mut Rows, index: us
         clipboard_buttons(app, ui, id);
         message_button(app, ui, id);
         ui.separator();
-        selection_actions(app, ui, groups);
+        selection_actions(app, ui, groups, true);
         ui.separator();
-        if crate::context_menu::button(ui, "Delete", "delete").clicked() {
-            delete_feature(app, id);
-            ui.close();
-        }
-        delete_after_marker_button(app, ui, id, index, marker);
+        delete_button(app, ui, id);
+        delete_after_marker_button(app, ui, id, index, marker, None);
     });
     if edit {
         rows.edit = Some(id);
