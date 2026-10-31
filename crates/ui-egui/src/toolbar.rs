@@ -1287,6 +1287,9 @@ fn ribbon_tabs(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect) {
                     }
                     if response.clicked() {
                         app.ui.tab = tab.to_string();
+                        // Floating ribbons draw after the viewport. An instant surface switch
+                        // needs one more pass too; settled tabs never schedule their own frames.
+                        ui.ctx().request_repaint();
                     }
                     if response.secondary_clicked() {
                         crate::context_menu::open_for(

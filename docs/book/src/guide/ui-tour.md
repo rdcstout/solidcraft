@@ -6,7 +6,10 @@
   the File menu (New, Open, Save, Save As, Export…), undo and redo, the Home tab (the start page)
   and one tab per open design (each with its own undo history, selection and camera; a dot marks
   unsaved changes). On the right: Report a bug, Help (?), Preferences (which hold the theme) and the
-  window's buttons.
+  window's buttons. On Linux, to have your desktop's own title bar and window buttons instead, set
+  `SOLIDCRAFT_TITLEBAR=system` or put `"titlebar": "system"` in `graphics.json` in the settings
+  folder (see [Troubleshooting](troubleshooting.md#reset-the-settings)) and restart; `app` (the
+  default) puts the application bar back.
 - **Toolbar.** The workspace switcher (DESIGN) sits on the left. The tabs (MODEL, SURFACE,
   ASSEMBLE, INSERT, INSPECT, MANAGE, VIEW and SHEET METAL) hold sections of commands. SKETCH appears while
   editing a sketch; SHEET METAL is always there and is highlighted for the active sheet body. Both select automatically
@@ -121,7 +124,8 @@
   wide as that column; the column comes back as it was when the dialog closes.
   Interface › **Dialog buttons** › **Top** puts OK, Cancel and Apply in
   the dialog's title row, right of the title, where they stay while sections open and close;
-  Cancel then also takes the place of the close button. Enter and Esc work as before.
+  Cancel then also takes the place of the close button. Enter and Esc work as before. The Sketch
+  panel's Finish Sketch, Look at and Slice move up under its title, above the options.
 - **Timeline** (bottom). Every feature in order. Double-click to edit, drag the marker to roll
   back, and drag features to reorder them. A sketch's icon, here and in the browser, takes the
   colour of its state: the sketch colour while it is under constrained, the fully constrained
@@ -384,11 +388,11 @@ Four ids are reserved for definitions owned by the app:
 
 A theme declares these with their required type and a default; it may also narrow a range's
 `min` and `max`. The default is clamped to those bounds. Other fields are ignored, including
-presentation text, `step` (fixed at 1 for standard ranges), unit and parent. A wrong type or
+presentation text, `step` (fixed at 20 for `tab_fade_ms`, 1 for other standard ranges), unit and parent. A wrong type or
 bounds outside the standard range are import errors. Declaring `tab_fade_ms` also requires
 declaring its boolean parent, `tab_colours`. Custom options cannot redefine reserved ids.
-Only `opacity` currently has a registered standard behaviour. `blur`, `tab_colours` and
-`tab_fade_ms` remain absent from the list until their behaviours are registered.
+`opacity`, `tab_colours` and `tab_fade_ms` have registered standard behaviours. `blur` remains
+absent from the list until its behaviour is registered.
 The resolver exposes declared standard options in the order `opacity`, `blur`, `tab_colours`,
 each immediately followed by its child, then custom options in declared order.
 
@@ -401,6 +405,43 @@ offered opacity, every token is exactly the original resolved value. The support
 white viewport extremes, each fill's actual alpha rises as necessary. This also protects
 against background overrides and busy models. A theme whose authored foreground and opaque
 fill already fail contrast receives full alpha; opacity never rewrites the theme's text colours.
+
+Imported themes can also declare `tabs`, using exact ribbon registry names. Only `panel`,
+`viewport_top` and `viewport_bottom` are accepted; an unknown tab or any other token is an
+import error. Tabs without an entry keep the base surfaces. Existing tab accent fills, inks
+and tints keep their own tokens. For example, save this original theme as a JSON file and import it:
+
+```json
+{
+  "format": "solidcraft-theme/1",
+  "name": "Garden tabs",
+  "base": "dark",
+  "options": [
+    {"id": "tab_colours", "type": "bool", "default": true},
+    {"id": "tab_fade_ms", "type": "range", "default": 240}
+  ],
+  "tabs": {
+    "SKETCH": {"panel": "#123028", "viewport_top": "#103128", "viewport_bottom": "#204a3c"},
+    "RENDER": {"panel": "#302039", "viewport_top": "#30203d", "viewport_bottom": "#493252"}
+  }
+}
+```
+
+The [imported light/dark fixtures](../../../../crates/ui-egui/tests/fixtures/theme-tabs.json)
+also provide Model surfaces. No built-in theme declares tab surfaces. With `tab_colours`
+off or absent, every tab keeps the base palette. With it on, `tab_fade_ms` blends panel and
+viewport surfaces together in Oklab with an ease-out cubic curve; zero switches instantly.
+A tab change during a fade starts from the colours currently displayed. Opacity readability
+floors also apply to tab panels and interpolated alpha. A viewport set to the opposite light/dark
+palette keeps that palette; a flat background preference takes precedence over tab gradients. Definitions and authored defaults
+roundtrip through theme export; saved option values are excluded.
+
+Render's untouched, unsaved preview also uses these animated surfaces, including viewport
+palette and flat-colour preferences. Explicit scene backplates, transparency, environments,
+gradient backdrops and saved setups keep their existing background instead. Saved setups do
+not record whether their background was explicitly chosen, so even a setup saved only for its
+camera conservatively retains its scene backplate. With tab surfaces absent/off, Render keeps
+its original flat scene background. Theme surfaces never change rendered images or exports.
 
 Up to 32 overlays apply in file order, after the base palette and the theme's own value tables.
 Later matching entries win by key. Every overlay has one `when`: `{"opt":"id","eq":value}`

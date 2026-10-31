@@ -139,6 +139,13 @@ completed changes in that design's undo history. Returning restores the conversa
 messages wait for **Send**. Closing a design closes its conversation. Conversations are kept
 only while the tabs remain open.
 
+When the agent itself creates a new design or opens a file, its conversation follows the new
+design and the same turn continues. Its completed changes stay in each design's own undo
+history. The original tab starts a fresh conversation if you return to it. Opening a file that
+is already in another tab returns an error instead of displacing that tab's conversation;
+select that tab yourself to continue there. Your own New, Open and tab switches still stop
+the current turn. Stop also cancels a file the agent is still opening.
+
 The input stays enabled during a turn. **Enter** queues the message: it shows in the conversation
 as a **Queued** bubble that you can **Edit** or remove (×) until it is sent. Several queued
 messages go as one prompt, in order, when the turn ends normally.
@@ -158,7 +165,7 @@ messages go as one prompt, in order, when the turn ends normally.
 
 Preferences → AI → **Agents** lists every agent the chat can use, each with its kind (a program or
 an endpoint), version or model, whether it looks signed in, **Test**, **Default** (the one a new
-conversation starts with), its own permission setting, and **Remove** for the ones you added.
+conversation starts with), its own permission setting, and **Edit** and **Remove** for the ones you added.
 
 ### Found by themselves
 
@@ -259,6 +266,14 @@ Grok Build also supports `XAI_API_KEY` for users who choose API authentication.
   hardware, or a long message with many tool results) may need more; raise it here or in the
   endpoint's entry under **Agents**, where a change applies from the next request. A request that
   runs out of time ends the message with the limit it hit and where to raise it.
+
+**Edit** on an agent you added opens the same dialog filled with its name and command, or its
+protocol, endpoint, model and request timeout, and **Save** changes it in place: it keeps its id,
+its permission setting and the tools you always allow for it. A stored key is never shown: leave
+the key field empty to keep it, or type a new one to replace it. A saved key still only goes to
+HTTPS or this computer, so moving an endpoint with a key to a plain `http://` address elsewhere is
+refused. The running conversation takes a new request timeout at once; a new command, endpoint
+or model applies the next time the agent connects.
 
 For Ollama, choosing a model checks its reported capabilities in the background. If its
 capabilities list lacks `tools`, a warning below the model picker explains that the model can
